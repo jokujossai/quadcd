@@ -1,0 +1,88 @@
+# Stage 1: Build QuadCD and integration test binary
+FROM docker.io/library/rust:1.93.1-trixie@sha256:51c04d7a2b38418ba23ecbfb373c40d3bd493dec1ddfae00ab5669527320195e AS builder
+
+RUN rustup target add x86_64-unknown-linux-musl
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+
+# Build statically linked binaries (musl) so they run on UBI9 regardless of glibc version
+COPY ./src ./src
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+    && strip target/x86_64-unknown-linux-musl/release/quadcd
+COPY --exclude=tests/containerized/image ./tests/ ./tests/
+RUN cargo test --release --target x86_64-unknown-linux-musl --test containerized --no-run \
+    && find target/x86_64-unknown-linux-musl/release/deps -name 'containerized-*' ! -name '*.d' \
+       -exec cp {} /build/quadcd-test \; \
+    && strip /build/quadcd-test
+
+# Stage 2: Common test environment base (ubi-init has systemd pre-configured as PID 1)
+FROM docker.io/redhat/ubi9-init@sha256:166697ef294f6c499c8423ec4818006ee8025af7ad92ecd80eb4175553533415 AS test-base
+
+RUN dnf install -y podman git && dnf clean all && \
+    rpm --setcaps shadow-utils 2>/dev/null && \
+    systemctl mask dnf-makecache.timer
+
+# Install the test runner script
+COPY tests/containerized/image/run-test.sh /usr/local/bin/run-test.sh
+RUN chmod +x /usr/local/bin/run-test.sh
+
+# Safety timer: force poweroff after 60s to prevent CI hangs
+COPY tests/containerized/image/quadcd-safety.timer /etc/systemd/system/quadcd-safety.timer
+COPY tests/containerized/image/quadcd-safety.service /etc/systemd/system/quadcd-safety.service
+RUN systemctl enable quadcd-safety.timer
+
+# Sync service unit (used by service_integration tests, started on demand)
+COPY dist/quadcd-sync.service /etc/systemd/system/quadcd-sync.service
+
+# User-mode sync service (global user unit, started on demand by user tests)
+COPY dist/quadcd-sync-user.service /etc/systemd/user/quadcd-sync.service
+
+# Patch systemd units with -v flag
+RUN sed -i -E 's/^(ExecStart=.*)/\1 -v/' /etc/systemd/system/quadcd-sync.service /etc/systemd/user/quadcd-sync.service
+
+# Override the service output to journal+console
+RUN mkdir -p /etc/systemd/system/service.d /etc/systemd/user/service.d
+COPY tests/containerized/image/service-output.conf /etc/systemd/system/service.d/service-output.conf
+COPY tests/containerized/image/service-output.conf /etc/systemd/user/service.d/service-output.conf
+
+# Create a non-root test user for --user mode tests.
+# Override subuid/subgid to fit within the outer rootless container's UID range (0-65536).
+RUN useradd -m quadcd-test && \
+    mkdir -p /var/lib/systemd/linger && \
+    touch /var/lib/systemd/linger/quadcd-test && \
+    (echo "quadcd-test:1:999" && echo "quadcd-test:1001:64535") | tee /etc/subuid /etc/subgid >/dev/null
+
+# Disable PAM for the user manager: unix_chkpwd (setuid) doesn't work in
+# rootless containers on Ubuntu, causing user@.service to fail (status=224/PAM).
+RUN mkdir -p /etc/systemd/system/user@.service.d && \
+    printf '[Service]\nPAMName=\nEnvironment=XDG_RUNTIME_DIR=/run/user/%%i\n' > /etc/systemd/system/user@.service.d/no-pam.conf
+
+# Test service: runs after boot, executes the test, then powers off
+COPY tests/containerized/image/quadcd-test.service /etc/systemd/system/quadcd-test.service
+RUN systemctl enable quadcd-test.service
+
+CMD ["/usr/sbin/init"]
+
+# Stage 3: Install binaries built from source
+FROM test-base AS test-build
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/quadcd /usr/local/bin/quadcd
+COPY --from=builder /build/quadcd-test /usr/local/bin/quadcd-test
+RUN mkdir -p /etc/systemd/system-generators /usr/lib/systemd/user-generators \
+    && ln -sf /usr/local/bin/quadcd /etc/systemd/system-generators/quadcd \
+    && ln -sf /usr/local/bin/quadcd /usr/lib/systemd/user-generators/quadcd
+
+# Stage 4: Install prebuilt binaries (CI)
+# Build with: podman build --target test-prebuilt --build-arg QUADCD_BINARY=... --build-arg TEST_BINARY=... ...
+FROM test-base AS test-prebuilt
+ARG QUADCD_BINARY
+ARG TEST_BINARY
+COPY ${QUADCD_BINARY} /usr/local/bin/quadcd
+COPY ${TEST_BINARY} /usr/local/bin/quadcd-test
+RUN chmod +x /usr/local/bin/quadcd /usr/local/bin/quadcd-test \
+    && mkdir -p /etc/systemd/system-generators /usr/lib/systemd/user-generators \
+    && ln -sf /usr/local/bin/quadcd /etc/systemd/system-generators/quadcd \
+    && ln -sf /usr/local/bin/quadcd /usr/lib/systemd/user-generators/quadcd
+
+# Default target: build from source
+FROM test-build AS test

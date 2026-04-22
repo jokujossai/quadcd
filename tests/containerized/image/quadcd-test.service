@@ -1,0 +1,11 @@
+[Unit]
+Description=QuadCD integration test
+After=multi-user.target
+Wants=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/run-test.sh
+
+[Install]
+WantedBy=multi-user.target

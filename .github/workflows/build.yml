@@ -1,0 +1,213 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Check installer portability
+        run: |
+          dash -n install.sh
+          if grep -n 'pipefail' install.sh; then
+            echo "Error: install.sh must remain POSIX sh compatible"
+            exit 1
+          fi
+          if grep -nE 'trap[[:space:]].*ERR' install.sh; then
+            echo "Error: install.sh must not use trap ERR"
+            exit 1
+          fi
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          disable_annotations: true
+      - name: Check Cargo.lock is up to date
+        run: cargo check --locked
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+      - name: Install cargo-nextest and cargo-llvm-cov
+        timeout-minutes: 1
+        uses: taiki-e/install-action@06203676c62f0d3c765be3f2fcfbebbcb02d09f5 # v2.69.6
+        with:
+          tool: nextest@0.9.129,cargo-llvm-cov@0.8.4
+      - name: Run tests with coverage
+        id: test
+        run: |
+          rustup component add llvm-tools-preview
+          mkdir -p target/coverage
+          cargo llvm-cov nextest --profile ci \
+            --cobertura --output-path target/coverage/cobertura.xml \
+            --ignore-filename-regex 'main\.rs'
+      - name: Test summary
+        if: steps.test.outcome == 'success' || steps.test.outcome == 'failure'
+        uses: test-summary/action@31493c76ec9e7aa675f1585d3ed6f1da69269a86 # v2.4
+        with:
+          paths: target/nextest/ci/junit.xml
+      - name: Coverage PR comment
+        if: github.event_name == 'pull_request'
+        uses: 5monkeys/cobertura-action@ee5787cc56634acddedc51f21c7947985531e6eb # v14
+        with:
+          path: target/coverage/cobertura.xml
+          minimum_coverage: 50
+          show_line: true
+
+  build:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        with:
+          disable_annotations: true
+
+      - name: Build
+        uses: zijiren233/cargo-cross@cbd95130522ee4eb724dc1c67759f041cd9a42b8 # v1.4.2
+        with:
+          command: build
+          targets: |
+            x86_64-unknown-linux-musl
+            aarch64-unknown-linux-musl
+          crt-static: true
+
+      - name: Build containerized integration test binary
+        uses: zijiren233/cargo-cross@cbd95130522ee4eb724dc1c67759f041cd9a42b8 # v1.4.2
+        with:
+          command: test
+          target: x86_64-unknown-linux-musl
+          cargo-args: "--test containerized --no-run"
+          crt-static: true
+
+      - name: Rename binaries
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/quadcd quadcd-linux-x86_64
+          cp target/aarch64-unknown-linux-musl/release/quadcd quadcd-linux-aarch64
+
+          # Verify only one containerized test binary is found
+          CONTAINERIZED_TEST_BINARY="$(find target/x86_64-unknown-linux-musl/release/deps -name 'containerized-*' ! -name '*.d')"
+          if [ -z "$CONTAINERIZED_TEST_BINARY" ]; then
+            echo "Error: No containerized test binary found"
+            exit 1
+          fi
+          if [ $(echo "$CONTAINERIZED_TEST_BINARY" | wc -l) -ne 1 ]; then
+            echo "Error: Multiple containerized test binaries found"
+            exit 1
+          fi
+
+          cp "$CONTAINERIZED_TEST_BINARY" quadcd-test-containerized-linux-x86_64
+
+      - name: Upload build artifact (x86_64)
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: quadcd-linux-x86_64
+          path: quadcd-linux-x86_64
+
+      - name: Upload build artifact (aarch64)
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: quadcd-linux-aarch64
+          path: quadcd-linux-aarch64
+
+      - name: Upload containerized integration test binary
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: quadcd-test-containerized-linux-x86_64
+          path: quadcd-test-containerized-linux-x86_64
+
+  integration-test:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Download build artifact (x86_64)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: quadcd-linux-x86_64
+      - name: Download build artifact (containerized test binary)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: quadcd-test-containerized-linux-x86_64
+
+      - name: Build test container with prebuilt binaries
+        timeout-minutes: 1
+        run: |
+          podman build -t quadcd-test \
+            --target test-prebuilt \
+            --build-arg QUADCD_BINARY=quadcd-linux-x86_64 \
+            --build-arg TEST_BINARY=quadcd-test-containerized-linux-x86_64 \
+            -f tests/containerized/image/Containerfile .
+
+      - name: Run containerized systemd integration tests
+        run: |
+          set -o pipefail
+          podman run --rm -t --privileged --systemd=always --timeout 120 quadcd-test 2>&1 | tee integration-output.txt
+          echo '### Integration Tests' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -o 'test result: .*' integration-output.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: [build, test, integration-test]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Verify tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "ERROR: Tag v${tag} does not match Cargo.toml version ${cargo_version}"
+            exit 1
+          fi
+      - name: Download artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: quadcd-linux-*
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          sha256sum quadcd-linux-* > SHA256SUMS
+
+      - name: Create release and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # Create release if it doesn't exist
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --title "$tag" --generate-notes
+          fi
+          # Upload binaries and checksums
+          for file in quadcd-linux-*; do
+            gh release upload "$tag" "$file" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+          gh release upload "$tag" SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber

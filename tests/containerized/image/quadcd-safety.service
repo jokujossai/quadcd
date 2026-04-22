@@ -1,0 +1,6 @@
+[Unit]
+Description=Safety timeout service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl poweroff

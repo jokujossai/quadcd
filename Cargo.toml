@@ -1,0 +1,32 @@
+[package]
+name = "quadcd"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "A systemd generator and CD tool for Quadlet containers and systemd units"
+license = "MIT"
+repository = "https://github.com/jokujossai/quadcd"
+homepage = "https://github.com/jokujossai/quadcd"
+authors = ["QuadCD Contributors"]
+keywords = ["systemd", "quadlet", "podman", "deployment", "containers"]
+categories = ["command-line-utilities"]
+
+[features]
+test-support = []
+
+[dependencies]
+libc = "0.2"
+tempfile = "3"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+dotenvy = "0.15"
+fundu = "2"
+notify = "7"
+subprocess = "1"
+
+[dev-dependencies]
+assert_cmd = "2.1.2"
+predicates = "3.1.4"
+quadcd = { path = ".", features = ["test-support"] }
+rstest = "0.25"
+tempfile = "3"

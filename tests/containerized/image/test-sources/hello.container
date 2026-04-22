@@ -1,0 +1,8 @@
+[Container]
+Image=quay.io/podman/hello:latest
+
+[Service]
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

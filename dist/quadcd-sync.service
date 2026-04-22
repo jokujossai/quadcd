@@ -1,0 +1,15 @@
+[Unit]
+Description=QuadCD Sync Service
+After=network-online.target
+Wants=network-online.target
+ConditionFileIsExecutable=/usr/local/bin/quadcd
+ConditionFileNotEmpty=/etc/quadcd.toml
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/quadcd sync --service
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target

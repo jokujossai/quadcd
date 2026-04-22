@@ -1,0 +1,8 @@
+[Unit]
+Description=Safety timeout for integration test
+
+[Timer]
+OnBootSec=60s
+
+[Install]
+WantedBy=timers.target
