@@ -1,3 +1,6 @@
+[workspace]
+exclude = ["ci-tools"]
+
 [package]
 name = "quadcd"
 version = "0.1.0"
