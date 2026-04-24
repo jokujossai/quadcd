@@ -10,5 +10,5 @@ publish = false
 # taiki-e/install-action, which downloads prebuilt binaries.
 
 [dependencies]
-cargo-nextest = "=0.9.129"
+cargo-nextest = "=0.9.133"
 cargo-llvm-cov = "=0.8.5"
