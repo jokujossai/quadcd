@@ -1,0 +1,14 @@
+[package]
+name = "ci-tools"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# This package exists solely so Dependabot tracks CI tool versions.
+# It is excluded from the root workspace and never built. The versions
+# below are parsed by .github/workflows/build.yml and passed to
+# taiki-e/install-action, which downloads prebuilt binaries.
+
+[dependencies]
+cargo-nextest = "=0.9.129"
+cargo-llvm-cov = "=0.8.4"

@@ -41,11 +41,22 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy -- -D warnings
+      - name: Resolve CI tool versions from ci-tools/Cargo.toml
+        id: tools
+        run: |
+          nextest=$(sed -nE 's/^cargo-nextest[[:space:]]*=[[:space:]]*"=?([0-9.]+)".*/\1/p' ci-tools/Cargo.toml)
+          llvmcov=$(sed -nE 's/^cargo-llvm-cov[[:space:]]*=[[:space:]]*"=?([0-9.]+)".*/\1/p' ci-tools/Cargo.toml)
+          if [ -z "$nextest" ] || [ -z "$llvmcov" ]; then
+            echo "Error: failed to parse tool versions from ci-tools/Cargo.toml"
+            exit 1
+          fi
+          echo "nextest=$nextest" >> "$GITHUB_OUTPUT"
+          echo "llvmcov=$llvmcov" >> "$GITHUB_OUTPUT"
       - name: Install cargo-nextest and cargo-llvm-cov
         timeout-minutes: 1
         uses: taiki-e/install-action@787505cde8a44ea468a00478fe52baf23b15bccd # v2.75.21
         with:
-          tool: nextest@0.9.129,cargo-llvm-cov@0.8.4
+          tool: nextest@${{ steps.tools.outputs.nextest }},cargo-llvm-cov@${{ steps.tools.outputs.llvmcov }}
       - name: Run tests with coverage
         id: test
         run: |
