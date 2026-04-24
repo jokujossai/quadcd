@@ -271,7 +271,7 @@ fn service_graceful_shutdown() {
 
 #[test]
 #[ignore]
-fn service_lock_prevents_concurrent_sync() {
+fn service_allows_concurrent_manual_sync() {
     let _ctx = SyncTestContext::new();
 
     let bare = create_bare_repo(
@@ -293,17 +293,16 @@ fn service_lock_prevents_concurrent_sync() {
 
     start_sync_service();
 
-    // Wait for initial sync so the service is running and holds the lock
+    // Wait for initial sync so the service is running and between ticks
     wait_for_file("myapp", "hello.service", Duration::from_secs(10));
 
-    // Try to run quadcd sync manually — should fail with lock error
+    // Manual `quadcd sync` should now succeed alongside the running service;
+    // it waits briefly if the service happens to be mid-tick.
     let output = run_quadcd(&["sync", "-v"]);
-    assert!(!output.status.success(), "concurrent sync should fail");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Another quadcd sync instance is running"),
-        "stderr: {stderr}"
+        output.status.success(),
+        "concurrent sync should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 
     assert!(is_service_active(), "service should still be running");

@@ -421,27 +421,50 @@ pub fn warn_duplicate_units(source_dirs: &[(PathBuf, HashMap<String, String>)], 
     }
 }
 
-/// Acquire an exclusive, non-blocking lock on `data_dir/.quadcd-sync.lock`.
-///
-/// Returns the open `File` handle whose lifetime holds the lock. The lock is
-/// released automatically when the handle is dropped.
-///
-/// Fails immediately (non-blocking) if another process already holds the lock.
-pub fn acquire_sync_lock(data_dir: &Path) -> Result<fs::File, String> {
+fn open_sync_lock_file(data_dir: &Path) -> Result<fs::File, String> {
     let lock_path = data_dir.join(".quadcd-sync.lock");
-    let file = fs::OpenOptions::new()
+    fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(&lock_path)
-        .map_err(|e| format!("Failed to open lock file {}: {e}", lock_path.display()))?;
+        .map_err(|e| format!("Failed to open lock file {}: {e}", lock_path.display()))
+}
 
+/// Acquire an exclusive lock on `data_dir/.quadcd-sync.lock`, blocking until
+/// any other holder releases it.
+///
+/// Returns the open `File` handle whose lifetime holds the lock. The lock is
+/// released automatically when the handle is dropped.
+pub fn acquire_sync_lock(data_dir: &Path) -> Result<fs::File, String> {
+    let file = open_sync_lock_file(data_dir)?;
     use std::os::unix::io::AsRawFd;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
-        return Err("Another quadcd sync instance is running".to_string());
+        let err = std::io::Error::last_os_error();
+        return Err(format!("Failed to acquire sync lock: {err}"));
     }
     Ok(file)
+}
+
+/// Try to acquire an exclusive lock on `data_dir/.quadcd-sync.lock` without
+/// blocking.
+///
+/// Returns `Ok(Some(file))` when the lock was acquired, `Ok(None)` when another
+/// process already holds it, or `Err(_)` on a real I/O failure.
+pub fn try_acquire_sync_lock(data_dir: &Path) -> Result<Option<fs::File>, String> {
+    let file = open_sync_lock_file(data_dir)?;
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(Some(file));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(None)
+    } else {
+        Err(format!("Failed to acquire sync lock: {err}"))
+    }
 }
 
 #[cfg(test)]

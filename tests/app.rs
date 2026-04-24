@@ -295,7 +295,11 @@ fn sync_accept_new_host_keys_flag() {
 }
 
 #[test]
-fn sync_lock_prevents_second_instance() {
+fn sync_waits_for_held_lock_then_proceeds() {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     let out_buf = TestWriter::new();
     let err_buf = TestWriter::new();
     let vcs = NoopVcs;
@@ -318,17 +322,21 @@ fn sync_lock_prevents_second_instance() {
 
     let data_dir = tmp.path().join(".local/share/quadcd");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let _lock = quadcd::install::acquire_sync_lock(&data_dir).unwrap();
+    let lock = quadcd::install::acquire_sync_lock(&data_dir).unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(200));
+        drop(lock);
+        tx.send(()).unwrap();
+    });
 
     let mut app = App::new_with_deps(cfg, &vcs, &systemd, &NoopImagePuller, &gen);
     let code = app.run(&["quadcd".to_string(), "sync".to_string()]);
 
-    assert_eq!(code, 1);
-    let stderr = err_buf.captured();
-    assert!(
-        stderr.contains("Another quadcd sync instance"),
-        "Expected lock contention error in: {stderr}"
-    );
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("releaser thread should have dropped the lock");
+    assert_eq!(code, 0, "sync should succeed once the lock is released");
 }
 
 // ===========================================================================

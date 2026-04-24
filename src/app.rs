@@ -349,15 +349,6 @@ impl<'a> App<'a> {
             return 1;
         }
 
-        // Acquire exclusive lock to prevent concurrent sync instances.
-        let _lock = match install::acquire_sync_lock(&self.cfg.data_dir) {
-            Ok(f) => f,
-            Err(e) => {
-                let _ = writeln!(self.cfg.output.err(), "Error: {e}");
-                return 1;
-            }
-        };
-
         if invocation.verbose {
             let mode = if self.cfg.is_user_mode {
                 "user"
@@ -403,6 +394,13 @@ impl<'a> App<'a> {
             runner.run_service(cd_config, &SHUTDOWN);
             0
         } else {
+            let _lock = match install::acquire_sync_lock(&self.cfg.data_dir) {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = writeln!(self.cfg.output.err(), "Error: {e}");
+                    return 1;
+                }
+            };
             let failures = runner.run_once(&cd_config);
             if failures > 0 {
                 1

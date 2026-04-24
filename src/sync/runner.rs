@@ -12,6 +12,7 @@ use notify::{EventKind, RecursiveMode, Watcher};
 
 use crate::cd_config::CDConfig;
 use crate::config::Config;
+use crate::install;
 
 use super::image::{dedup_images, extract_images, ImagePuller, ImageRef};
 use super::repo::{safe_repo_dir, sync_repo_inner, SyncResult, SyncStatus};
@@ -303,15 +304,27 @@ impl<'a> SyncRunner<'a> {
     ///
     /// Runs until the `shutdown` flag is set (e.g. by a signal handler).
     pub fn run_service(self, cd_config: CDConfig, shutdown: &AtomicBool) {
-        // Initial sync
-        let result = self.sync_all(&cd_config);
-        self.apply_changes(&result.changed_files);
-        if result.failures > 0 {
-            let _ = writeln!(
-                self.cfg.output.err(),
-                "[quadcd] {} repository sync(s) failed on startup",
-                result.failures
-            );
+        // Initial sync — held under the sync lock, then released before the
+        // main loop so manual `quadcd sync` invocations can run between ticks.
+        match install::acquire_sync_lock(&self.cfg.data_dir) {
+            Ok(lock) => {
+                let result = self.sync_all(&cd_config);
+                self.apply_changes(&result.changed_files);
+                if result.failures > 0 {
+                    let _ = writeln!(
+                        self.cfg.output.err(),
+                        "[quadcd] {} repository sync(s) failed on startup",
+                        result.failures
+                    );
+                }
+                drop(lock);
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    self.cfg.output.err(),
+                    "[quadcd] Failed to acquire sync lock for initial sync: {e}"
+                );
+            }
         }
 
         // Set up per-repo interval tracking
@@ -388,6 +401,7 @@ impl<'a> SyncRunner<'a> {
 
         // Main loop — tick is the smallest configured interval
         let mut tick = current_config.min_interval();
+        let mut consecutive_skips: u32 = 0;
         while !shutdown.load(Ordering::Relaxed) {
             // Polling fallback: check mtime when watcher is unavailable
             if watcher.is_none() {
@@ -404,12 +418,15 @@ impl<'a> SyncRunner<'a> {
                 let _ = writeln!(self.cfg.output.err(), "{msg}");
             }
 
-            let failures = self.service_tick(
+            // Acquire the sync lock only for the active sync phase so that
+            // manual `quadcd sync` invocations can run between ticks.
+            let failures = self.try_acquire_and_tick(
                 &rx,
                 &mut current_config,
                 &mut last_sync,
                 &mut tick,
                 shutdown,
+                &mut consecutive_skips,
             );
             if failures > 0 {
                 let _ = writeln!(
@@ -544,6 +561,49 @@ impl<'a> SyncRunner<'a> {
                     "[quadcd] Warning: config path not set, cannot reload"
                 );
                 None
+            }
+        }
+    }
+
+    /// Try to acquire the sync lock and run one `service_tick`. If the lock
+    /// is held by another process (typically a manual `quadcd sync`), the
+    /// tick is skipped and `consecutive_skips` is incremented; a log line is
+    /// emitted every skip so operators can see how long the service has
+    /// deferred. `consecutive_skips` is reset to 0 on successful acquire.
+    ///
+    /// Returns the number of repositories that failed to sync this tick
+    /// (always 0 when the tick was skipped).
+    pub(crate) fn try_acquire_and_tick(
+        &self,
+        rx: &mpsc::Receiver<()>,
+        current_config: &mut CDConfig,
+        last_sync: &mut HashMap<String, Instant>,
+        tick: &mut std::time::Duration,
+        shutdown: &AtomicBool,
+        consecutive_skips: &mut u32,
+    ) -> usize {
+        match install::try_acquire_sync_lock(&self.cfg.data_dir) {
+            Ok(Some(lock)) => {
+                *consecutive_skips = 0;
+                let failures = self.service_tick(rx, current_config, last_sync, tick, shutdown);
+                drop(lock);
+                failures
+            }
+            Ok(None) => {
+                *consecutive_skips = consecutive_skips.saturating_add(1);
+                let _ = writeln!(
+                    self.cfg.output.err(),
+                    "[quadcd] Service sync skipped ({n} consecutive skip(s) since last successful sync) — lock held by another quadcd process",
+                    n = *consecutive_skips
+                );
+                0
+            }
+            Err(e) => {
+                let _ = writeln!(
+                    self.cfg.output.err(),
+                    "[quadcd] Failed to acquire sync lock this tick: {e}"
+                );
+                0
             }
         }
     }
@@ -1335,5 +1395,161 @@ interval = "5m"
     fn check_config_mtime_missing_file() {
         let result = SyncRunner::check_config_mtime(Path::new("/no/such/file"), None);
         assert!(result.is_none());
+    }
+
+    // try_acquire_and_tick
+
+    fn idle_cd_config() -> CDConfig {
+        let mut repos = HashMap::new();
+        // Long interval ensures service_tick performs no sync work — we're
+        // only exercising the lock-acquire-and-dispatch path here.
+        repos.insert(
+            "myrepo".to_string(),
+            RepoConfig {
+                url: "https://example.com/repo.git".to_string(),
+                branch: None,
+                interval: Some("1h".to_string()),
+            },
+        );
+        CDConfig {
+            repositories: repos,
+        }
+    }
+
+    #[test]
+    fn try_acquire_and_tick_resets_counter_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+        cfg.data_dir = tmp.path().to_path_buf();
+
+        let vcs = MockVcs::new();
+        let systemd = MockSystemd::new();
+        let image_puller = MockImagePuller::new();
+        let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
+
+        let (_tx, rx) = mpsc::channel::<()>();
+        let mut cd_config = idle_cd_config();
+        let mut last_sync: HashMap<String, Instant> = HashMap::new();
+        last_sync.insert("myrepo".to_string(), Instant::now());
+        let mut tick = cd_config.min_interval();
+        let shutdown = AtomicBool::new(false);
+        let mut skips: u32 = 7;
+
+        let failures = runner.try_acquire_and_tick(
+            &rx,
+            &mut cd_config,
+            &mut last_sync,
+            &mut tick,
+            &shutdown,
+            &mut skips,
+        );
+
+        assert_eq!(failures, 0);
+        assert_eq!(skips, 0, "counter should reset when the lock is acquired");
+    }
+
+    #[test]
+    fn try_acquire_and_tick_skips_and_logs_when_lock_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err_buf = crate::output::tests::TestWriter::new();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
+        cfg.data_dir = tmp.path().to_path_buf();
+
+        let vcs = MockVcs::new();
+        let systemd = MockSystemd::new();
+        let image_puller = MockImagePuller::new();
+        let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
+
+        // Hold the sync lock externally to simulate a concurrent manual sync.
+        let _held = crate::install::acquire_sync_lock(&cfg.data_dir).unwrap();
+
+        let (_tx, rx) = mpsc::channel::<()>();
+        let mut cd_config = idle_cd_config();
+        let mut last_sync: HashMap<String, Instant> = HashMap::new();
+        last_sync.insert("myrepo".to_string(), Instant::now());
+        let mut tick = cd_config.min_interval();
+        let shutdown = AtomicBool::new(false);
+        let mut skips: u32 = 0;
+
+        let failures = runner.try_acquire_and_tick(
+            &rx,
+            &mut cd_config,
+            &mut last_sync,
+            &mut tick,
+            &shutdown,
+            &mut skips,
+        );
+        assert_eq!(failures, 0);
+        assert_eq!(skips, 1);
+
+        // Second contended call should increment the counter again and log.
+        let failures = runner.try_acquire_and_tick(
+            &rx,
+            &mut cd_config,
+            &mut last_sync,
+            &mut tick,
+            &shutdown,
+            &mut skips,
+        );
+        assert_eq!(failures, 0);
+        assert_eq!(skips, 2);
+
+        let stderr = err_buf.captured();
+        assert!(
+            stderr.contains("Service sync skipped (1 consecutive skip(s)")
+                && stderr.contains("Service sync skipped (2 consecutive skip(s)")
+                && stderr.contains("lock held by another quadcd process"),
+            "expected skip log with counter, got: {stderr}"
+        );
+
+        // No sync work should have been performed while the lock was held.
+        assert!(vcs.pull_called.borrow().is_empty());
+        assert!(vcs.clone_called.borrow().is_empty());
+        assert!(!*systemd.reload_called.borrow());
+    }
+
+    #[test]
+    fn try_acquire_and_tick_resets_counter_after_contention() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+        cfg.data_dir = tmp.path().to_path_buf();
+
+        let vcs = MockVcs::new();
+        let systemd = MockSystemd::new();
+        let image_puller = MockImagePuller::new();
+        let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
+
+        let (_tx, rx) = mpsc::channel::<()>();
+        let mut cd_config = idle_cd_config();
+        let mut last_sync: HashMap<String, Instant> = HashMap::new();
+        last_sync.insert("myrepo".to_string(), Instant::now());
+        let mut tick = cd_config.min_interval();
+        let shutdown = AtomicBool::new(false);
+        let mut skips: u32 = 0;
+
+        // Contended tick.
+        {
+            let _held = crate::install::acquire_sync_lock(&cfg.data_dir).unwrap();
+            runner.try_acquire_and_tick(
+                &rx,
+                &mut cd_config,
+                &mut last_sync,
+                &mut tick,
+                &shutdown,
+                &mut skips,
+            );
+        }
+        assert_eq!(skips, 1);
+
+        // Lock is now free — next call should acquire and reset the counter.
+        runner.try_acquire_and_tick(
+            &rx,
+            &mut cd_config,
+            &mut last_sync,
+            &mut tick,
+            &shutdown,
+            &mut skips,
+        );
+        assert_eq!(skips, 0);
     }
 }
