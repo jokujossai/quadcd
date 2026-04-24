@@ -25,7 +25,7 @@ notify = "7"
 subprocess = "1"
 
 [dev-dependencies]
-assert_cmd = "2.1.2"
+assert_cmd = "2.2.1"
 predicates = "3.1.4"
 quadcd = { path = ".", features = ["test-support"] }
 rstest = "0.25"
