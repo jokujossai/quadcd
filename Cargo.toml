@@ -28,5 +28,5 @@ subprocess = "1"
 assert_cmd = "2.2.1"
 predicates = "3.1.4"
 quadcd = { path = ".", features = ["test-support"] }
-rstest = "0.25"
+rstest = "0.26"
 tempfile = "3"
