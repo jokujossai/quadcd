@@ -18,7 +18,7 @@ test-support = []
 libc = "0.2"
 tempfile = "3"
 serde = { version = "1", features = ["derive"] }
-toml = "0.8"
+toml = "1.0"
 dotenvy = "0.15"
 fundu = "2"
 notify = "8"
