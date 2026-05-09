@@ -236,8 +236,8 @@ curl -fsSL https://raw.githubusercontent.com/jokujossai/quadcd/main/install.sh |
 This POSIX `sh` installer is fetched from `main`, but it installs the latest
 published release binary to `/usr/local/bin/quadcd`, creates symlinks in both
 user and system generator directories, installs sync service unit files, and
-enables them via `systemctl`. The installer is kept backward compatible with the
-latest published release assets and bundled service files.
+prints instructions for enabling them. The installer is kept backward
+compatible with the latest published release assets and bundled service files.
 
 ### Installer Environment Variables
 
@@ -249,29 +249,52 @@ latest published release assets and bundled service files.
 <details>
 <summary>Manual install</summary>
 
-1. Download the binary for your architecture from the
+1. Download the binary and `SHA256SUMS` for your architecture from the
    [latest release](https://github.com/jokujossai/quadcd/releases/latest)
-   and install it:
+   and verify the checksum:
 
    ```sh
-   sudo install -Dm755 quadcd /usr/local/bin/quadcd
+   sha256sum -c --ignore-missing SHA256SUMS
    ```
 
-2. Create generator symlinks:
+2. Install the binary:
+
+   ```sh
+   sudo install -Dm755 quadcd-linux-$(uname -m) /usr/local/bin/quadcd
+   ```
+
+3. Create generator symlinks:
 
    ```sh
    sudo ln -sf /usr/local/bin/quadcd /etc/systemd/user-generators/quadcd
    sudo ln -sf /usr/local/bin/quadcd /etc/systemd/system-generators/quadcd
    ```
 
-3. Reload systemd:
+4. Install the sync service units (optional, for git-based continuous deployment):
+
+   ```sh
+   sudo curl -fsSL -o /etc/systemd/system/quadcd-sync.service \
+     https://raw.githubusercontent.com/jokujossai/quadcd/main/dist/quadcd-sync.service
+   sudo curl -fsSL -o /etc/systemd/user/quadcd-sync.service \
+     https://raw.githubusercontent.com/jokujossai/quadcd/main/dist/quadcd-sync-user.service
+   ```
+
+5. Reload systemd:
 
    ```sh
    sudo systemctl daemon-reload
    systemctl --user daemon-reload
    ```
 
-Optionally install the [sync service units](dist/) for git-based continuous deployment.
+6. Enable the sync service if installed in step 4:
+
+   ```sh
+   # System mode
+   sudo systemctl enable --now quadcd-sync.service
+
+   # User mode (per user)
+   systemctl --user enable --now quadcd-sync.service
+   ```
 
 </details>
 
