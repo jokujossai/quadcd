@@ -196,6 +196,7 @@ impl Config {
             } else {
                 merge_env_vars(&self.env_vars, &dir_env)
             };
+            let effective = with_repo_root(effective, &self.source_dir, self.verbose, &self.output);
             vec![(self.source_dir.clone(), effective)]
         } else {
             self.source_dirs()
@@ -242,6 +243,7 @@ impl Config {
                 }
                 merged
             };
+            let effective = with_repo_root(effective, &entry, self.verbose, &self.output);
             dirs.push((entry, effective));
         }
 
@@ -487,6 +489,36 @@ fn merge_env_vars(
     merged
 }
 
+/// Reserved substitution variable: absolute path to the source directory
+/// currently being installed from. Always overrides any `.env`-supplied value.
+const RESERVED_REPO_ROOT: &str = "QUADCD_REPO_ROOT";
+
+/// Insert the reserved `QUADCD_REPO_ROOT` variable into `vars`, overriding any
+/// user-supplied value of the same key. When verbose mode is on and the user's
+/// `.env` had attempted to set the reserved key, log a one-line warning so the
+/// silent override is visible.
+fn with_repo_root(
+    mut vars: HashMap<String, String>,
+    dir: &Path,
+    verbose: bool,
+    output: &Output,
+) -> HashMap<String, String> {
+    let value = dir.to_string_lossy().into_owned();
+    if verbose {
+        if let Some(prev) = vars.get(RESERVED_REPO_ROOT) {
+            if prev != &value {
+                let _ = writeln!(
+                    output.err(),
+                    "[quadcd] Note: ignoring user-supplied {RESERVED_REPO_ROOT}={prev} \
+                    (reserved, set to {value})"
+                );
+            }
+        }
+    }
+    vars.insert(RESERVED_REPO_ROOT.to_string(), value);
+    vars
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_source_dirs_no_env_files_returns_empty_vars() {
+    fn effective_source_dirs_no_env_files_returns_only_reserved_vars() {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         fs::create_dir_all(data_dir.join("subdir")).unwrap();
@@ -702,7 +734,11 @@ mod tests {
 
         let dirs = cfg.effective_source_dirs();
         assert_eq!(dirs.len(), 1);
-        assert!(dirs[0].1.is_empty());
+        assert_eq!(dirs[0].1.len(), 1);
+        assert_eq!(
+            dirs[0].1[RESERVED_REPO_ROOT],
+            dirs[0].0.to_string_lossy().to_string()
+        );
     }
 
     // merge_env_vars

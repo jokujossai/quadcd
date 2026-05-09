@@ -67,6 +67,64 @@ fn effective_source_dirs_quadcd_unit_dirs_with_per_dir_env() {
 }
 
 #[test]
+fn effective_source_dirs_injects_repo_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    fs::create_dir_all(data_dir.join("alpha")).unwrap();
+    fs::create_dir_all(data_dir.join("beta")).unwrap();
+    // alpha tries to override the reserved variable — must be ignored.
+    fs::write(
+        data_dir.join("alpha/.env"),
+        "QUADCD_REPO_ROOT=/should/be/ignored\nUSER_VAR=keep-me",
+    )
+    .unwrap();
+
+    let out = TestWriter::new();
+    let err = TestWriter::new();
+    let mut cfg = test_config(&out, &err);
+    cfg.quadcd_unit_dirs = None;
+    cfg.data_dir = data_dir.clone();
+
+    let dirs = cfg.effective_source_dirs();
+    assert_eq!(dirs.len(), 2);
+
+    assert!(dirs[0].0.ends_with("alpha"));
+    assert_eq!(
+        dirs[0].1["QUADCD_REPO_ROOT"],
+        dirs[0].0.to_string_lossy().to_string(),
+        "alpha QUADCD_REPO_ROOT must be its own path, not the user override"
+    );
+    assert_eq!(dirs[0].1["USER_VAR"], "keep-me");
+
+    assert!(dirs[1].0.ends_with("beta"));
+    assert_eq!(
+        dirs[1].1["QUADCD_REPO_ROOT"],
+        dirs[1].0.to_string_lossy().to_string(),
+        "beta QUADCD_REPO_ROOT must be its own path"
+    );
+}
+
+#[test]
+fn effective_source_dirs_unit_dirs_injects_repo_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source_dir = tmp.path().join("custom");
+    fs::create_dir_all(&source_dir).unwrap();
+
+    let out = TestWriter::new();
+    let err = TestWriter::new();
+    let mut cfg = test_config(&out, &err);
+    cfg.quadcd_unit_dirs = Some(source_dir.to_string_lossy().to_string());
+    cfg.source_dir = source_dir.clone();
+
+    let dirs = cfg.effective_source_dirs();
+    assert_eq!(dirs.len(), 1);
+    assert_eq!(
+        dirs[0].1["QUADCD_REPO_ROOT"],
+        source_dir.to_string_lossy().to_string()
+    );
+}
+
+#[test]
 fn source_dirs_verbose_logs_effective_vars() {
     let tmp = tempfile::tempdir().unwrap();
     let data_dir = tmp.path().join("data");
