@@ -111,11 +111,18 @@ fi
 
 if [ -d /run/systemd/system ]; then
   systemctl daemon-reload
-  systemctl enable quadcd-sync.service
-  echo "Enabled system sync service"
 
-  systemctl --global enable quadcd-sync.service
-  echo "Enabled user sync service"
+  cat <<'EOF'
+
+To start syncing, enable the sync service:
+
+  # System mode
+  sudo systemctl enable --now quadcd-sync.service
+
+  # User mode (per user)
+  systemctl --user enable --now quadcd-sync.service
+
+EOF
 else
   echo "Note: systemd not detected, skipping service enablement" >&2
 fi

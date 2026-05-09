@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Installer no longer auto-enables `quadcd-sync.service`; it prints `systemctl enable` instructions for the user to run instead. Previous behavior used `systemctl --global enable`, which enabled the service for every user including future ones.
+
 ## 0.1.0
 
 Initial public release.
