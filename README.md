@@ -171,6 +171,26 @@ IMAGE_TAG=latest
 Image=${REGISTRY}/myimage:${IMAGE_TAG}
 ```
 
+### Reserved Variables
+
+QuadCD always sets the following variable when processing a source directory; user `.env` files cannot override it.
+
+| Variable | Value |
+|----------|-------|
+| `QUADCD_REPO_ROOT` | Absolute path of the source directory the unit was loaded from (e.g. the synced repo checkout, or `~/.local/share/quadcd/local/`) |
+
+This lets you mount configuration files committed alongside your unit files into containers:
+
+**~/.local/share/quadcd/<repo>/myapp.container**:
+
+```ini
+[Container]
+Image=ghcr.io/me/app:latest
+Volume=${QUADCD_REPO_ROOT}/configs/app.yaml:/etc/app.yaml:Z,ro
+```
+
+When the unit is generated, `${QUADCD_REPO_ROOT}` is replaced with the absolute path of the directory holding `myapp.container`.
+
 ## Drop-in Files
 
 Podman and systemd support drop-in configuration files that let you override or extend base unit files. QuadCD automatically symlinks `*.d/` drop-in directories from the standard Quadlet directory into the generator's working directory, so they are applied when the Podman generator runs.

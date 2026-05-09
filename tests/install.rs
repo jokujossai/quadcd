@@ -45,6 +45,42 @@ fn install_quadlet_files_copies_with_substitution() {
     );
 }
 
+#[test]
+fn install_quadlet_files_substitutes_repo_root() {
+    let src = tempfile::tempdir().unwrap();
+    let out_dir = tempfile::tempdir().unwrap();
+    let quadlet_dir = out_dir.path().join("quadcd");
+    fs::create_dir_all(&quadlet_dir).unwrap();
+
+    let container_src = src.path().join("app.container");
+    fs::write(
+        &container_src,
+        "[Container]\nVolume=${QUADCD_REPO_ROOT}/configs/app.yaml:/etc/app.yaml:Z,ro\n",
+    )
+    .unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert(
+        "QUADCD_REPO_ROOT".to_string(),
+        src.path().to_string_lossy().into_owned(),
+    );
+
+    let out = TestWriter::new();
+    let err = TestWriter::new();
+    let cfg = test_config(&out, &err);
+    install_quadlet_files(src.path(), &quadlet_dir, &vars, &cfg).unwrap();
+
+    let installed = fs::read_to_string(quadlet_dir.join("app.container")).unwrap();
+    let expected = format!(
+        "Volume={}/configs/app.yaml:/etc/app.yaml:Z,ro",
+        src.path().display()
+    );
+    assert!(
+        installed.contains(&expected),
+        "expected {expected}, content: {installed}"
+    );
+}
+
 // ===========================================================================
 // install_systemd_units
 // ===========================================================================
