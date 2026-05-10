@@ -13,6 +13,70 @@ pub struct ImageRef {
     pub image: String,
     pub auth_file: Option<String>,
     pub tls_verify: Option<bool>,
+    /// Extra arguments forwarded verbatim to `podman pull`.
+    pub podman_args: Vec<String>,
+}
+
+const PULL_PASSTHROUGH_FLAGS: &[&str] = &[
+    "--authfile",
+    "--tls-verify",
+    "--creds",
+    "--cert-dir",
+    "--os",
+    "--arch",
+    "--variant",
+    "--platform",
+    "--decryption-key",
+];
+
+/// Tokenize a `PodmanArgs=` value into individual argument strings.
+///
+/// Splits on unquoted whitespace; single- and double-quoted spans are kept
+/// together (quotes are stripped). No backslash escaping is supported.
+fn split_args(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+
+    for ch in s.chars() {
+        match in_quote {
+            Some(q) if ch == q => in_quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => in_quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// Keep only args from `PodmanArgs=` in a `.container` file that are valid
+/// for `podman pull`.  Handles both `--flag=value` and `--flag value` forms.
+fn filter_pull_args(args: Vec<String>) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut iter = args.into_iter().peekable();
+    while let Some(token) = iter.next() {
+        if let Some(eq_pos) = token.find('=') {
+            let flag = &token[..eq_pos];
+            if PULL_PASSTHROUGH_FLAGS.contains(&flag) {
+                result.push(token);
+            }
+        } else if PULL_PASSTHROUGH_FLAGS.contains(&token.as_str()) {
+            result.push(token);
+            if let Some(val) = iter.next() {
+                result.push(val);
+            }
+        }
+        // else: runtime-only flag — skip
+    }
+    result
 }
 
 /// Abstraction over container image pulling.
@@ -71,6 +135,7 @@ pub(crate) fn extract_images(
         let mut auth_file = None;
         let mut tls_verify = None;
         let mut pull_never = false;
+        let mut podman_args_raw: Vec<String> = Vec::new();
 
         for line in content.lines() {
             let trimmed = line.trim();
@@ -89,6 +154,9 @@ pub(crate) fn extract_images(
                     if val.trim().eq("never") {
                         pull_never = true;
                     }
+                }
+                if let Some(val) = trimmed.strip_prefix("PodmanArgs=") {
+                    podman_args_raw.extend(split_args(val));
                 }
             }
             if is_image && current_section == Some("Image") {
@@ -117,10 +185,16 @@ pub(crate) fn extract_images(
             if image.ends_with(".image") || image.ends_with(".build") {
                 continue;
             }
+            let podman_args = if is_image {
+                podman_args_raw
+            } else {
+                filter_pull_args(podman_args_raw)
+            };
             images.push(ImageRef {
                 image,
                 auth_file,
                 tls_verify,
+                podman_args,
             });
         }
     }
@@ -353,6 +427,166 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].image, "quay.io/podman/hello:latest");
         assert_eq!(images[0].auth_file.as_deref(), Some("/run/auth.json"));
+    }
+
+    // split_args
+
+    #[test]
+    fn split_args_simple() {
+        assert_eq!(
+            split_args("--authfile=/run/auth.json --os=linux"),
+            vec!["--authfile=/run/auth.json", "--os=linux"]
+        );
+    }
+
+    #[test]
+    fn split_args_double_quoted() {
+        assert_eq!(
+            split_args("--creds=\"user:pass word\""),
+            vec!["--creds=user:pass word"]
+        );
+    }
+
+    #[test]
+    fn split_args_single_quoted() {
+        assert_eq!(
+            split_args("--creds='user:pass word'"),
+            vec!["--creds=user:pass word"]
+        );
+    }
+
+    #[test]
+    fn split_args_extra_whitespace() {
+        assert_eq!(split_args("  --os=linux  "), vec!["--os=linux"]);
+    }
+
+    #[test]
+    fn split_args_empty() {
+        assert!(split_args("").is_empty());
+        assert!(split_args("   ").is_empty());
+    }
+
+    // filter_pull_args
+
+    #[test]
+    fn filter_pull_args_keeps_allowlisted_eq_form() {
+        let result = filter_pull_args(vec![
+            "--authfile=/run/auth.json".to_string(),
+            "--network=host".to_string(),
+            "--os=linux".to_string(),
+        ]);
+        assert_eq!(result, vec!["--authfile=/run/auth.json", "--os=linux"]);
+    }
+
+    #[test]
+    fn filter_pull_args_keeps_allowlisted_space_form() {
+        let result = filter_pull_args(vec![
+            "--authfile".to_string(),
+            "/run/auth.json".to_string(),
+            "--network".to_string(),
+            "host".to_string(),
+        ]);
+        assert_eq!(result, vec!["--authfile", "/run/auth.json"]);
+    }
+
+    #[test]
+    fn filter_pull_args_drops_all_runtime_flags() {
+        let result = filter_pull_args(vec![
+            "--network=host".to_string(),
+            "--cap-add=SYS_ADMIN".to_string(),
+            "--volume=/data:/data".to_string(),
+        ]);
+        assert!(result.is_empty());
+    }
+
+    // PodmanArgs= in extract_images
+
+    #[test]
+    fn container_podman_args_pull_flag_included() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("app.container"),
+            "[Container]\nImage=quay.io/app:1\nPodmanArgs=--authfile=/run/auth.json\n",
+        )
+        .unwrap();
+
+        let images =
+            extract_images_helper(&["app.container".to_string()], tmp.path(), &HashMap::new());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].podman_args, vec!["--authfile=/run/auth.json"]);
+    }
+
+    #[test]
+    fn container_podman_args_runtime_flag_filtered() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("app.container"),
+            "[Container]\nImage=quay.io/app:1\nPodmanArgs=--network=host\n",
+        )
+        .unwrap();
+
+        let images =
+            extract_images_helper(&["app.container".to_string()], tmp.path(), &HashMap::new());
+        assert_eq!(images.len(), 1);
+        assert!(images[0].podman_args.is_empty());
+    }
+
+    #[test]
+    fn container_podman_args_mixed_keeps_only_pull_compatible() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("app.container"),
+            "[Container]\nImage=quay.io/app:1\nPodmanArgs=--authfile=/f --network=host --os=linux\n",
+        )
+        .unwrap();
+
+        let images =
+            extract_images_helper(&["app.container".to_string()], tmp.path(), &HashMap::new());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].podman_args, vec!["--authfile=/f", "--os=linux"]);
+    }
+
+    #[test]
+    fn image_podman_args_all_passed_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("app.image"),
+            "[Image]\nImage=quay.io/app:1\nPodmanArgs=--policy=always\n",
+        )
+        .unwrap();
+
+        let images = extract_images_helper(&["app.image".to_string()], tmp.path(), &HashMap::new());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].podman_args, vec!["--policy=always"]);
+    }
+
+    #[test]
+    fn image_podman_args_multiple_lines_accumulated() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("app.image"),
+            "[Image]\nImage=quay.io/app:1\nPodmanArgs=--os=linux\nPodmanArgs=--arch=amd64\n",
+        )
+        .unwrap();
+
+        let images = extract_images_helper(&["app.image".to_string()], tmp.path(), &HashMap::new());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].podman_args, vec!["--os=linux", "--arch=amd64"]);
+    }
+
+    #[test]
+    fn container_podman_args_ignored_outside_container_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("app.container"),
+            "[Unit]\nPodmanArgs=--authfile=/wrong\n[Container]\nImage=quay.io/app:1\n",
+        )
+        .unwrap();
+
+        let images =
+            extract_images_helper(&["app.container".to_string()], tmp.path(), &HashMap::new());
+        assert_eq!(images.len(), 1);
+        assert!(images[0].podman_args.is_empty());
     }
 }
 

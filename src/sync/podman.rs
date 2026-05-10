@@ -67,6 +67,10 @@ impl ImagePuller for Podman {
             args.push(flag);
         }
 
+        for arg in &image.podman_args {
+            args.push(arg.as_str());
+        }
+
         args.push(&image.image);
 
         if cfg.verbose {
