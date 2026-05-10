@@ -5,6 +5,7 @@
 ### Added
 
 - Reserved `${QUADCD_REPO_ROOT}` substitution variable resolving to the absolute path of each source directory, allowing repo-relative paths in `Volume=`, `EnvironmentFile=`, and other unit-file directives. User `.env` files cannot override it.
+- `PodmanArgs=` values in `.image` files are now forwarded to `podman pull` (all args are pull-valid per the quadlet spec). In `.container` files, only pull-compatible flags are forwarded: `--authfile`, `--tls-verify`, `--creds`, `--cert-dir`, `--os`, `--arch`, `--variant`, `--platform`, and `--decryption-key`; runtime-only flags are silently ignored.
 
 ### Changed
 

@@ -36,6 +36,7 @@ fn simple_image(name: &str) -> ImageRef {
         image: name.to_string(),
         auth_file: None,
         tls_verify: None,
+        podman_args: vec![],
     }
 }
 
@@ -109,6 +110,7 @@ fn pull_passes_authfile_flag() {
         image: "registry.example.com/app:v1".to_string(),
         auth_file: Some("/run/secrets/auth.json".to_string()),
         tls_verify: None,
+        podman_args: vec![],
     };
     podman.pull(&image, &cfg);
 
@@ -128,6 +130,7 @@ fn pull_passes_tls_verify_flag() {
         image: "registry.example.com/app:v1".to_string(),
         auth_file: None,
         tls_verify: Some(false),
+        podman_args: vec![],
     };
     podman.pull(&image, &cfg);
 
@@ -144,6 +147,7 @@ fn pull_passes_all_flags() {
         image: "registry.example.com/app:v1".to_string(),
         auth_file: Some("/auth.json".to_string()),
         tls_verify: Some(true),
+        podman_args: vec![],
     };
     podman.pull(&image, &cfg);
 
@@ -153,6 +157,28 @@ fn pull_passes_all_flags() {
         "expected both flags, got: {stderr}"
     );
     assert!(stderr.contains("registry.example.com/app:v1"));
+}
+
+// podman_args forwarding
+
+#[test]
+fn pull_passes_podman_args() {
+    let podman = fake_podman(1);
+    let (cfg, err_buf) = test_cfg_with_capture(false);
+
+    let image = ImageRef {
+        image: "registry.example.com/app:v1".to_string(),
+        auth_file: None,
+        tls_verify: None,
+        podman_args: vec!["--os=linux".to_string(), "--arch=amd64".to_string()],
+    };
+    podman.pull(&image, &cfg);
+
+    let stderr = err_buf.captured();
+    assert!(
+        stderr.contains("--os=linux") && stderr.contains("--arch=amd64"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
