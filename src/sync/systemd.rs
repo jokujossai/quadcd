@@ -16,6 +16,7 @@ pub trait SystemdTrait {
     fn daemon_reload(&self, cfg: &Config);
     fn restart(&self, units: &[String], cfg: &Config);
     fn start(&self, units: &[String], cfg: &Config);
+    fn stop(&self, units: &[String], cfg: &Config);
     /// Return the `is-enabled` state string for a unit (e.g. "enabled", "static",
     /// "disabled", "masked", "generated"). Returns "unknown" on error.
     fn is_enabled(&self, unit: &str, cfg: &Config) -> String;
@@ -179,6 +180,36 @@ impl SystemdTrait for Systemd {
         }
     }
 
+    fn stop(&self, units: &[String], cfg: &Config) {
+        let mut args = Self::user_args(cfg);
+        args.push("stop");
+        let unit_refs: Vec<&str> = units.iter().map(|s| s.as_str()).collect();
+        args.extend(&unit_refs);
+
+        let unit_list = units.join(" ");
+        let label = format!("{} {}", self.cmd, args.join(" "));
+        match run_with_markers(
+            self.exec().args(args.iter().copied()),
+            &label,
+            cfg.subprocess_output.as_ref(),
+        ) {
+            Ok(s) if !s.success() => {
+                let _ = writeln!(
+                    cfg.output.err(),
+                    "[quadcd] stop {unit_list} exited with {s}"
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(cfg.output.err(), "[quadcd] Failed to stop {unit_list}: {e}");
+            }
+            Ok(_) => {
+                if cfg.verbose {
+                    let _ = writeln!(cfg.output.err(), "[quadcd] Stopped {unit_list}");
+                }
+            }
+        }
+    }
+
     fn is_enabled(&self, unit: &str, cfg: &Config) -> String {
         let mut args = Self::user_args(cfg);
         args.extend(["is-enabled", unit]);
@@ -225,6 +256,10 @@ pub mod testing {
         pub reload_called: RefCell<bool>,
         pub restarted: RefCell<Vec<String>>,
         pub started: RefCell<Vec<String>>,
+        pub stopped: RefCell<Vec<String>>,
+        /// Records the order of trait method invocations (`"reload"`, `"stop:foo"`,
+        /// `"restart:bar"`, …) so tests can assert ordering across methods.
+        pub call_log: RefCell<Vec<String>>,
         pub enabled_map: RefCell<HashMap<String, String>>,
         pub active_set: RefCell<HashSet<String>>,
         pub listed_units: RefCell<HashMap<String, Vec<String>>>,
@@ -236,6 +271,8 @@ pub mod testing {
                 reload_called: RefCell::new(false),
                 restarted: RefCell::new(Vec::new()),
                 started: RefCell::new(Vec::new()),
+                stopped: RefCell::new(Vec::new()),
+                call_log: RefCell::new(Vec::new()),
                 enabled_map: RefCell::new(HashMap::new()),
                 active_set: RefCell::new(HashSet::new()),
                 listed_units: RefCell::new(HashMap::new()),
@@ -246,12 +283,25 @@ pub mod testing {
     impl SystemdTrait for MockSystemd {
         fn daemon_reload(&self, _cfg: &Config) {
             *self.reload_called.borrow_mut() = true;
+            self.call_log.borrow_mut().push("reload".to_string());
         }
         fn restart(&self, units: &[String], _cfg: &Config) {
             self.restarted.borrow_mut().extend_from_slice(units);
+            for u in units {
+                self.call_log.borrow_mut().push(format!("restart:{u}"));
+            }
         }
         fn start(&self, units: &[String], _cfg: &Config) {
             self.started.borrow_mut().extend_from_slice(units);
+            for u in units {
+                self.call_log.borrow_mut().push(format!("start:{u}"));
+            }
+        }
+        fn stop(&self, units: &[String], _cfg: &Config) {
+            self.stopped.borrow_mut().extend_from_slice(units);
+            for u in units {
+                self.call_log.borrow_mut().push(format!("stop:{u}"));
+            }
         }
         fn is_enabled(&self, unit: &str, _cfg: &Config) -> String {
             self.enabled_map

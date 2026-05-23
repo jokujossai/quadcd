@@ -159,8 +159,9 @@ fn changed_files_detects_unit_files() {
     run_git_in(&clone, &["commit", "-m", "add service"]);
     let sha2 = git_vcs().head_sha(&clone).unwrap();
 
-    let changed = git_vcs().changed_files(&clone, &sha1, &sha2);
-    assert!(changed.contains(&"web.service".to_string()));
+    let changes = git_vcs().changed_files(&clone, &sha1, &sha2);
+    assert!(changes.changed.contains(&"web.service".to_string()));
+    assert!(changes.deleted.is_empty());
 }
 
 #[test]
@@ -174,8 +175,40 @@ fn changed_files_filters_non_units() {
     run_git_in(&clone, &["commit", "-m", "add readme"]);
     let sha2 = git_vcs().head_sha(&clone).unwrap();
 
-    let changed = git_vcs().changed_files(&clone, &sha1, &sha2);
-    assert!(!changed.contains(&"README.md".to_string()));
+    let changes = git_vcs().changed_files(&clone, &sha1, &sha2);
+    assert!(!changes.changed.contains(&"README.md".to_string()));
+}
+
+#[test]
+fn changed_files_detects_deletions() {
+    let (_tmp, _bare, clone) = setup_repo();
+    let sha1 = git_vcs().head_sha(&clone).unwrap();
+
+    // setup_repo() already committed app.container; remove it.
+    std::fs::remove_file(clone.join("app.container")).unwrap();
+    run_git_in(&clone, &["rm", "app.container"]);
+    run_git_in(&clone, &["commit", "-m", "remove app"]);
+    let sha2 = git_vcs().head_sha(&clone).unwrap();
+
+    let changes = git_vcs().changed_files(&clone, &sha1, &sha2);
+    assert!(changes.changed.is_empty());
+    assert_eq!(changes.deleted, vec!["app.container".to_string()]);
+}
+
+#[test]
+fn changed_files_detects_rename_as_delete_plus_add() {
+    let (_tmp, _bare, clone) = setup_repo();
+    let sha1 = git_vcs().head_sha(&clone).unwrap();
+
+    // Rename app.container -> renamed.container
+    std::fs::rename(clone.join("app.container"), clone.join("renamed.container")).unwrap();
+    run_git_in(&clone, &["add", "-A"]);
+    run_git_in(&clone, &["commit", "-m", "rename app"]);
+    let sha2 = git_vcs().head_sha(&clone).unwrap();
+
+    let changes = git_vcs().changed_files(&clone, &sha1, &sha2);
+    assert!(changes.changed.contains(&"renamed.container".to_string()));
+    assert!(changes.deleted.contains(&"app.container".to_string()));
 }
 
 #[test]

@@ -11,6 +11,10 @@
 
 - Installer no longer auto-enables `quadcd-sync.service`; it prints `systemctl enable` instructions for the user to run instead. Previous behavior used `systemctl --global enable`, which enabled the service for every user including future ones.
 
+### Fixed
+
+- Units whose source files are removed from a synced repo are now stopped before `systemctl daemon-reload`. Previously, deletions were lumped into the changed-files list and fed to `systemctl restart` after the reload — by then systemd had forgotten the units, so the underlying Podman containers were left running as orphans. Renames are treated as a delete of the old path plus an add of the new path.
+
 ## 0.1.0
 
 Initial public release.

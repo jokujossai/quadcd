@@ -22,7 +22,7 @@ pub use podman::Podman;
 pub use repo::{SyncResult, SyncStatus};
 pub use runner::SyncRunner;
 pub use systemd::{Systemd, SystemdTrait};
-pub use vcs::{GitVcs, Vcs};
+pub use vcs::{GitVcs, UnitChanges, Vcs};
 
 pub(crate) use units::is_unit_file;
 
