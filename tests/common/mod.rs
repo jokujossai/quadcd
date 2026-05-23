@@ -90,6 +90,13 @@ impl SystemdTrait for NoopSystemd {
     fn list_units_matching(&self, _pattern: &str, _cfg: &Config) -> Vec<String> {
         vec![]
     }
+    fn show_state(&self, _unit: &str, _cfg: &Config) -> quadcd::sync::UnitState {
+        quadcd::sync::UnitState {
+            active_state: "active".into(),
+            sub_state: "running".into(),
+            result: "success".into(),
+        }
+    }
 }
 
 #[allow(dead_code)]

@@ -343,3 +343,46 @@ fn service_syncs_configured_branch() {
     );
     assert!(is_service_active(), "service should still be running");
 }
+
+#[test]
+#[ignore]
+fn service_sync_reports_failed_service() {
+    let _ctx = SyncTestContext::new();
+
+    // Service whose ExecStart always exits non-zero — systemd leaves it in
+    // `failed` state after start. No `Restart=` so it stays failed.
+    let bare = create_bare_repo(
+        "myapp",
+        &[(
+            "crash.service",
+            "[Service]\nType=simple\nExecStart=/bin/false\n",
+        )],
+    );
+
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.myapp]\nurl = \"{}\"\ninterval = \"2s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    start_sync_service();
+
+    wait_for_file("myapp", "crash.service", Duration::from_secs(10));
+
+    // The sync service should log the failed unit's state and an aggregated
+    // failure summary after starting it.
+    wait_until(
+        Duration::from_secs(15),
+        "sync to report failed crash.service",
+        || journal_contains("30s ago", "crash.service: failed"),
+    );
+    assert!(
+        journal_contains("30s ago", "service(s) failed after restart: crash.service"),
+        "expected aggregated failure summary in sync journal"
+    );
+
+    assert!(is_service_active(), "sync service should still be running");
+}

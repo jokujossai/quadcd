@@ -8,6 +8,30 @@ use crate::config::Config;
 
 use super::cmd::run_with_markers;
 
+/// Snapshot of a unit's runtime state, derived from `systemctl show`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitState {
+    pub active_state: String,
+    pub sub_state: String,
+    pub result: String,
+}
+
+impl UnitState {
+    pub fn unknown() -> Self {
+        Self {
+            active_state: "unknown".to_string(),
+            sub_state: "unknown".to_string(),
+            result: "unknown".to_string(),
+        }
+    }
+
+    /// Treat any state other than `active` and `activating` as a failure
+    /// worth surfacing to the operator after a start/restart.
+    pub fn is_failure(&self) -> bool {
+        !matches!(self.active_state.as_str(), "active" | "activating")
+    }
+}
+
 /// Abstraction over systemctl operations.
 ///
 /// `Systemd` shells out to systemctl; tests can substitute a mock that records
@@ -24,6 +48,9 @@ pub trait SystemdTrait {
     fn is_active(&self, unit: &str, cfg: &Config) -> bool;
     /// List loaded unit names matching a glob pattern (e.g. "foo@*.service").
     fn list_units_matching(&self, pattern: &str, cfg: &Config) -> Vec<String>;
+    /// Return the unit's `ActiveState`, `SubState`, and `Result` via
+    /// `systemctl show`. Returns `UnitState::unknown()` if the call fails.
+    fn show_state(&self, unit: &str, cfg: &Config) -> UnitState;
 }
 
 /// Systemctl implementation backed by the `systemctl` binary.
@@ -243,6 +270,38 @@ impl SystemdTrait for Systemd {
             _ => Vec::new(),
         }
     }
+
+    fn show_state(&self, unit: &str, cfg: &Config) -> UnitState {
+        let mut args = Self::user_args(cfg);
+        args.extend([
+            "show",
+            unit,
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=Result",
+        ]);
+
+        let Ok(capture) = self.exec().args(args.iter().copied()).capture() else {
+            return UnitState::unknown();
+        };
+        if !capture.success() {
+            return UnitState::unknown();
+        }
+
+        let stdout = String::from_utf8_lossy(&capture.stdout);
+        let mut state = UnitState::unknown();
+        for line in stdout.lines() {
+            if let Some((key, val)) = line.split_once('=') {
+                match key {
+                    "ActiveState" => state.active_state = val.to_string(),
+                    "SubState" => state.sub_state = val.to_string(),
+                    "Result" => state.result = val.to_string(),
+                    _ => {}
+                }
+            }
+        }
+        state
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -263,6 +322,7 @@ pub mod testing {
         pub enabled_map: RefCell<HashMap<String, String>>,
         pub active_set: RefCell<HashSet<String>>,
         pub listed_units: RefCell<HashMap<String, Vec<String>>>,
+        pub state_map: RefCell<HashMap<String, UnitState>>,
     }
 
     impl MockSystemd {
@@ -276,6 +336,7 @@ pub mod testing {
                 enabled_map: RefCell::new(HashMap::new()),
                 active_set: RefCell::new(HashSet::new()),
                 listed_units: RefCell::new(HashMap::new()),
+                state_map: RefCell::new(HashMap::new()),
             }
         }
     }
@@ -319,6 +380,17 @@ pub mod testing {
                 .get(pattern)
                 .cloned()
                 .unwrap_or_default()
+        }
+        fn show_state(&self, unit: &str, _cfg: &Config) -> UnitState {
+            self.state_map
+                .borrow()
+                .get(unit)
+                .cloned()
+                .unwrap_or_else(|| UnitState {
+                    active_state: "active".to_string(),
+                    sub_state: "running".to_string(),
+                    result: "success".to_string(),
+                })
         }
     }
 }
