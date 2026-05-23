@@ -572,6 +572,26 @@ mod tests {
             stderr.contains("app.service: active (running)"),
             "expected per-unit state log in: {stderr}"
         );
+        assert!(
+            !stderr.contains("service(s) failed after restart"),
+            "no aggregated failure line should be emitted when all units are active: {stderr}"
+        );
+    }
+
+    #[test]
+    fn unit_state_is_failure_classifies_states() {
+        use super::super::systemd::UnitState;
+        let mk = |s: &str| UnitState {
+            active_state: s.to_string(),
+            sub_state: "any".to_string(),
+            result: "any".to_string(),
+        };
+        assert!(!mk("active").is_failure());
+        assert!(!mk("activating").is_failure());
+        assert!(mk("failed").is_failure());
+        assert!(mk("inactive").is_failure());
+        assert!(mk("deactivating").is_failure());
+        assert!(UnitState::unknown().is_failure());
     }
 
     #[test]
