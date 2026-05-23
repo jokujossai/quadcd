@@ -628,11 +628,8 @@ mod tests {
         let err_buf = crate::output::tests::TestWriter::new();
         let cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
 
-        let failed = activate_changed_units_inner(
-            &systemd,
-            &["a.service".into(), "b.service".into()],
-            &cfg,
-        );
+        let failed =
+            activate_changed_units_inner(&systemd, &["a.service".into(), "b.service".into()], &cfg);
         assert_eq!(failed.len(), 2);
 
         let stderr = err_buf.captured();
