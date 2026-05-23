@@ -165,9 +165,10 @@ impl<'a> SyncRunner<'a> {
         }
     }
 
-    /// Restart changed units using `self.systemd`.
-    pub(crate) fn restart_changed_units(&self, changed_files: &[String]) {
-        activate_changed_units_inner(self.systemd, changed_files, self.cfg);
+    /// Restart changed units using `self.systemd`. Returns the list of units
+    /// that failed to reach an active/activating state after restart.
+    pub(crate) fn restart_changed_units(&self, changed_files: &[String]) -> Vec<String> {
+        activate_changed_units_inner(self.systemd, changed_files, self.cfg)
     }
 
     /// Stop units whose backing files were deleted by the sync.
@@ -288,7 +289,7 @@ impl<'a> SyncRunner<'a> {
         self.stop_deleted_units(&changes.deleted);
         self.systemd.daemon_reload(self.cfg);
         self.pre_pull_images(&changes.changed);
-        self.restart_changed_units(&changes.changed);
+        let _failed = self.restart_changed_units(&changes.changed);
     }
 
     /// One-shot sync: sync all repos, daemon-reload, then restart changed units.

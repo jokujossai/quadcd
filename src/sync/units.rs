@@ -64,11 +64,14 @@ pub(crate) fn is_template_unit(unit_name: &str) -> bool {
 /// - **Enabled / generated** units: `start` if not active, `restart` if active.
 /// - **Static** units: `restart` only if currently active.
 /// - **Disabled / masked** units: skipped.
+///
+/// Returns the list of units whose post-activation `ActiveState` is anything
+/// other than `active`/`activating` (i.e. failed to come up).
 pub(crate) fn activate_changed_units_inner(
     systemd: &dyn SystemdTrait,
     changed_files: &[String],
     cfg: &Config,
-) {
+) -> Vec<String> {
     let mut units: Vec<String> = changed_files
         .iter()
         .map(|f| unit_name_for_restart(f))
@@ -77,7 +80,7 @@ pub(crate) fn activate_changed_units_inner(
     units.dedup();
 
     if units.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let mut to_start: Vec<String> = Vec::new();
@@ -152,6 +155,35 @@ pub(crate) fn activate_changed_units_inner(
     if !to_restart.is_empty() {
         systemd.restart(&to_restart, cfg);
     }
+
+    let mut activated: Vec<String> = to_start.iter().chain(to_restart.iter()).cloned().collect();
+    activated.sort();
+    activated.dedup();
+
+    let mut failed: Vec<String> = Vec::new();
+    for unit in &activated {
+        let state = systemd.show_state(unit, cfg);
+        let _ = writeln!(
+            cfg.output.err(),
+            "[quadcd] {unit}: {} ({})",
+            state.active_state,
+            state.sub_state
+        );
+        if state.is_failure() {
+            failed.push(unit.clone());
+        }
+    }
+
+    if !failed.is_empty() {
+        let _ = writeln!(
+            cfg.output.err(),
+            "[quadcd] {} service(s) failed after restart: {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+
+    failed
 }
 
 /// Stop units whose backing files were deleted from the repo.
@@ -519,6 +551,111 @@ mod tests {
         assert!(
             stderr.contains("Skipping skip.service"),
             "expected skip log in: {stderr}"
+        );
+    }
+
+    #[test]
+    fn activate_reports_active_state_per_unit() {
+        let systemd = MockSystemd::new();
+        systemd
+            .enabled_map
+            .borrow_mut()
+            .insert("app.service".to_string(), "enabled".to_string());
+        let err_buf = crate::output::tests::TestWriter::new();
+        let cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
+
+        let failed = activate_changed_units_inner(&systemd, &["app.container".into()], &cfg);
+        assert!(failed.is_empty(), "no failure expected, got {failed:?}");
+
+        let stderr = err_buf.captured();
+        assert!(
+            stderr.contains("app.service: active (running)"),
+            "expected per-unit state log in: {stderr}"
+        );
+        assert!(
+            !stderr.contains("service(s) failed after restart"),
+            "no aggregated failure line should be emitted when all units are active: {stderr}"
+        );
+    }
+
+    #[test]
+    fn unit_state_is_failure_classifies_states() {
+        use super::super::systemd::UnitState;
+        let mk = |s: &str| UnitState {
+            active_state: s.to_string(),
+            sub_state: "any".to_string(),
+            result: "any".to_string(),
+        };
+        assert!(!mk("active").is_failure());
+        assert!(!mk("activating").is_failure());
+        assert!(mk("failed").is_failure());
+        assert!(mk("inactive").is_failure());
+        assert!(mk("deactivating").is_failure());
+        assert!(UnitState::unknown().is_failure());
+    }
+
+    #[test]
+    fn activate_reports_failed_state_and_returns_failures() {
+        use super::super::systemd::UnitState;
+        let systemd = MockSystemd::new();
+        systemd
+            .enabled_map
+            .borrow_mut()
+            .insert("app.service".to_string(), "enabled".to_string());
+        systemd.state_map.borrow_mut().insert(
+            "app.service".to_string(),
+            UnitState {
+                active_state: "failed".to_string(),
+                sub_state: "failed".to_string(),
+                result: "exit-code".to_string(),
+            },
+        );
+        let err_buf = crate::output::tests::TestWriter::new();
+        let cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
+
+        let failed = activate_changed_units_inner(&systemd, &["app.container".into()], &cfg);
+        assert_eq!(failed, vec!["app.service".to_string()]);
+
+        let stderr = err_buf.captured();
+        assert!(
+            stderr.contains("app.service: failed (failed)"),
+            "expected failure state log in: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 service(s) failed after restart: app.service"),
+            "expected failure summary in: {stderr}"
+        );
+    }
+
+    #[test]
+    fn activate_summary_lists_multiple_failures() {
+        use super::super::systemd::UnitState;
+        let systemd = MockSystemd::new();
+        for unit in &["a.service", "b.service"] {
+            systemd
+                .enabled_map
+                .borrow_mut()
+                .insert(unit.to_string(), "enabled".to_string());
+            systemd.state_map.borrow_mut().insert(
+                unit.to_string(),
+                UnitState {
+                    active_state: "failed".to_string(),
+                    sub_state: "failed".to_string(),
+                    result: "exit-code".to_string(),
+                },
+            );
+        }
+        let err_buf = crate::output::tests::TestWriter::new();
+        let cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
+
+        let failed =
+            activate_changed_units_inner(&systemd, &["a.service".into(), "b.service".into()], &cfg);
+        assert_eq!(failed.len(), 2);
+
+        let stderr = err_buf.captured();
+        assert!(
+            stderr.contains("2 service(s) failed after restart: a.service, b.service"),
+            "expected aggregated failure summary in: {stderr}"
         );
     }
 

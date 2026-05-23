@@ -343,3 +343,90 @@ fn service_syncs_configured_branch() {
     );
     assert!(is_service_active(), "service should still be running");
 }
+
+#[test]
+#[ignore]
+fn service_sync_reports_failed_quadlet_container() {
+    let _ctx = SyncTestContext::new();
+
+    // Quadlet container referencing an image that cannot be pulled. The
+    // generated <name>.service will fail during ExecStart, leaving the unit
+    // in `failed` state — sync should surface this in its journal.
+    let bare = create_bare_repo(
+        "broken",
+        &[(
+            "broken.container",
+            "[Container]\n\
+             Image=localhost/quadcd-does-not-exist:nope\n\n\
+             [Service]\nRestart=no\n",
+        )],
+    );
+
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.broken]\nurl = \"{}\"\ninterval = \"2s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    start_sync_service();
+
+    wait_for_file("broken", "broken.container", Duration::from_secs(10));
+
+    wait_until(
+        Duration::from_secs(30),
+        "sync to report failed broken.service",
+        || journal_contains("60s ago", "broken.service: failed"),
+    );
+    assert!(
+        journal_contains("60s ago", "service(s) failed after restart: broken.service"),
+        "expected aggregated failure summary for broken.service"
+    );
+
+    assert!(is_service_active(), "sync service should still be running");
+}
+
+#[test]
+#[ignore]
+fn service_sync_reports_failed_service() {
+    let _ctx = SyncTestContext::new();
+
+    // Service whose ExecStart always exits non-zero — systemd leaves it in
+    // `failed` state after start. No `Restart=` so it stays failed.
+    let bare = create_bare_repo(
+        "myapp",
+        &[(
+            "crash.service",
+            "[Service]\nType=simple\nExecStart=/bin/false\n",
+        )],
+    );
+
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.myapp]\nurl = \"{}\"\ninterval = \"2s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    start_sync_service();
+
+    wait_for_file("myapp", "crash.service", Duration::from_secs(10));
+
+    // The sync service should log the failed unit's state and an aggregated
+    // failure summary after starting it.
+    wait_until(
+        Duration::from_secs(15),
+        "sync to report failed crash.service",
+        || journal_contains("30s ago", "crash.service: failed"),
+    );
+    assert!(
+        journal_contains("30s ago", "service(s) failed after restart: crash.service"),
+        "expected aggregated failure summary in sync journal"
+    );
+
+    assert!(is_service_active(), "sync service should still be running");
+}
