@@ -8,6 +8,40 @@ use subprocess::{Capture, Exec, Redirection};
 
 use super::is_unit_file;
 
+/// Unit files affected by a diff between two commits.
+///
+/// `changed` contains files present at the new tree (added, modified, renamed-to,
+/// copied-to). `deleted` contains files that no longer exist (removed, renamed-from).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UnitChanges {
+    pub changed: Vec<String>,
+    pub deleted: Vec<String>,
+}
+
+impl UnitChanges {
+    pub fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.deleted.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.changed.len() + self.deleted.len()
+    }
+
+    /// Merge another set of changes into this one.
+    pub fn extend(&mut self, other: UnitChanges) {
+        self.changed.extend(other.changed);
+        self.deleted.extend(other.deleted);
+    }
+
+    /// Construct from a list of present files with no deletions (e.g. fresh clone).
+    pub fn from_present(changed: Vec<String>) -> Self {
+        Self {
+            changed,
+            deleted: Vec::new(),
+        }
+    }
+}
+
 /// Abstraction over version control operations.
 ///
 /// `GitVcs` shells out to git; tests can substitute a mock that operates purely
@@ -16,7 +50,7 @@ pub trait Vcs {
     fn check(&self) -> Result<(), String>;
     fn clone_repo(&self, url: &str, branch: Option<&str>, target: &Path) -> Result<(), String>;
     fn head_sha(&self, repo_dir: &Path) -> Option<String>;
-    fn changed_files(&self, repo_dir: &Path, old_sha: &str, new_sha: &str) -> Vec<String>;
+    fn changed_files(&self, repo_dir: &Path, old_sha: &str, new_sha: &str) -> UnitChanges;
     fn remote_url(&self, repo_dir: &Path) -> Result<String, String>;
     fn set_remote_url(&self, repo_dir: &Path, url: &str) -> Result<(), String>;
     fn fetch(&self, repo_dir: &Path) -> Result<(), String>;
@@ -133,6 +167,64 @@ impl GitVcs {
     }
 }
 
+/// Parse `git diff --name-status` output into `UnitChanges`.
+///
+/// Each line is `STATUS\tPATH`, except renames/copies which are
+/// `R<score>\tOLD\tNEW` / `C<score>\tOLD\tNEW`. For renames, the old path is
+/// treated as deleted and the new path as changed; for copies, the old path is
+/// untouched and only the new path is added.
+fn parse_name_status(stdout: &str) -> UnitChanges {
+    let mut changes = UnitChanges::default();
+    for line in stdout.lines() {
+        let mut parts = line.split('\t');
+        let status = match parts.next() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+        let kind = status.as_bytes()[0];
+        match kind {
+            b'D' => {
+                if let Some(path) = parts.next() {
+                    if is_unit_file(path) {
+                        changes.deleted.push(path.to_string());
+                    }
+                }
+            }
+            b'R' => {
+                let old = parts.next();
+                let new = parts.next();
+                if let Some(o) = old {
+                    if is_unit_file(o) {
+                        changes.deleted.push(o.to_string());
+                    }
+                }
+                if let Some(n) = new {
+                    if is_unit_file(n) {
+                        changes.changed.push(n.to_string());
+                    }
+                }
+            }
+            b'C' => {
+                // Source is untouched; only the new path is "added".
+                let _old = parts.next();
+                if let Some(n) = parts.next() {
+                    if is_unit_file(n) {
+                        changes.changed.push(n.to_string());
+                    }
+                }
+            }
+            _ => {
+                if let Some(path) = parts.next() {
+                    if is_unit_file(path) {
+                        changes.changed.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    changes
+}
+
 impl Vcs for GitVcs {
     fn check(&self) -> Result<(), String> {
         match self.run_git(&["--version"], "git check") {
@@ -181,21 +273,17 @@ impl Vcs for GitVcs {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     }
 
-    fn changed_files(&self, repo_dir: &Path, old_sha: &str, new_sha: &str) -> Vec<String> {
+    fn changed_files(&self, repo_dir: &Path, old_sha: &str, new_sha: &str) -> UnitChanges {
         let dir = repo_dir.to_string_lossy();
         let output = match self.run_git(
-            &["-C", &dir, "diff", "--name-only", old_sha, new_sha],
+            &["-C", &dir, "diff", "--name-status", old_sha, new_sha],
             "git diff",
         ) {
             Ok(o) if o.success() => o,
-            _ => return Vec::new(),
+            _ => return UnitChanges::default(),
         };
 
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|f| is_unit_file(f))
-            .map(|f| f.to_string())
-            .collect()
+        parse_name_status(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn remote_url(&self, repo_dir: &Path) -> Result<String, String> {
@@ -344,6 +432,74 @@ mod tests {
     }
 
     #[test]
+    fn parse_name_status_added_modified() {
+        let out = "A\tapp.container\nM\tweb.service\n";
+        let changes = parse_name_status(out);
+        assert_eq!(
+            changes.changed,
+            vec!["app.container".to_string(), "web.service".to_string()]
+        );
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn parse_name_status_deleted() {
+        let out = "D\told.container\n";
+        let changes = parse_name_status(out);
+        assert!(changes.changed.is_empty());
+        assert_eq!(changes.deleted, vec!["old.container".to_string()]);
+    }
+
+    #[test]
+    fn parse_name_status_rename_old_deleted_new_added() {
+        let out = "R100\told.container\tnew.container\n";
+        let changes = parse_name_status(out);
+        assert_eq!(changes.changed, vec!["new.container".to_string()]);
+        assert_eq!(changes.deleted, vec!["old.container".to_string()]);
+    }
+
+    #[test]
+    fn parse_name_status_copy_only_new() {
+        let out = "C75\tsrc.container\tcopy.container\n";
+        let changes = parse_name_status(out);
+        assert_eq!(changes.changed, vec!["copy.container".to_string()]);
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn parse_name_status_filters_non_units() {
+        let out = "A\tREADME.md\nM\tapp.container\nD\tnotes.txt\n";
+        let changes = parse_name_status(out);
+        assert_eq!(changes.changed, vec!["app.container".to_string()]);
+        assert!(changes.deleted.is_empty());
+    }
+
+    #[test]
+    fn parse_name_status_mixed() {
+        let out =
+            "A\tnew.service\nD\told.container\nM\tweb.container\nR100\tfrom.timer\tto.timer\n";
+        let changes = parse_name_status(out);
+        assert_eq!(
+            changes.changed,
+            vec![
+                "new.service".to_string(),
+                "web.container".to_string(),
+                "to.timer".to_string(),
+            ]
+        );
+        assert_eq!(
+            changes.deleted,
+            vec!["old.container".to_string(), "from.timer".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_name_status_empty() {
+        let changes = parse_name_status("");
+        assert!(changes.is_empty());
+    }
+
+    #[test]
     fn ssh_command_interactive() {
         let vcs = GitVcs::with_command(None, Duration::from_secs(60))
             .known_hosts(PathBuf::from("/data/.known_hosts"))
@@ -369,7 +525,7 @@ pub mod testing {
         pub fetch_called: RefCell<bool>,
         pub reset_hard_called: RefCell<Vec<String>>,
         pub set_remote_url_called: RefCell<Vec<String>>,
-        pub changed_files_val: RefCell<Vec<String>>,
+        pub changed_files_val: RefCell<UnitChanges>,
         pub post_pull_sha: RefCell<Option<String>>,
         pub default_branch_val: String,
     }
@@ -384,7 +540,7 @@ pub mod testing {
                 fetch_called: RefCell::new(false),
                 reset_hard_called: RefCell::new(Vec::new()),
                 set_remote_url_called: RefCell::new(Vec::new()),
-                changed_files_val: RefCell::new(Vec::new()),
+                changed_files_val: RefCell::new(UnitChanges::default()),
                 post_pull_sha: RefCell::new(Some("abc123".to_string())),
                 default_branch_val: "main".to_string(),
             }
@@ -407,7 +563,7 @@ pub mod testing {
         fn head_sha(&self, _repo_dir: &Path) -> Option<String> {
             self.head_sha_val.borrow().clone()
         }
-        fn changed_files(&self, _repo_dir: &Path, _old_sha: &str, _new_sha: &str) -> Vec<String> {
+        fn changed_files(&self, _repo_dir: &Path, _old_sha: &str, _new_sha: &str) -> UnitChanges {
             self.changed_files_val.borrow().clone()
         }
         fn remote_url(&self, _repo_dir: &Path) -> Result<String, String> {

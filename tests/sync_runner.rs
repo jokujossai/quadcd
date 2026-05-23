@@ -4,7 +4,7 @@ mod common;
 
 use common::{test_config, TestWriter};
 use quadcd::cd_config::{CDConfig, RepoConfig};
-use quadcd::sync::SyncRunner;
+use quadcd::sync::{SyncRunner, UnitChanges};
 use quadcd::testing::{MockImagePuller, MockSystemd, MockVcs};
 use std::collections::HashMap;
 use std::fs;
@@ -277,7 +277,7 @@ fn sync_all_error_is_logged() {
     };
 
     let result = runner.sync_all(&cd_config);
-    assert!(result.changed_files.is_empty());
+    assert!(result.changes.is_empty());
     assert_eq!(result.failures, 1);
 
     let stderr = err_buf.captured();
@@ -296,7 +296,7 @@ fn sync_all_updated_empty_changed() {
     let vcs = MockVcs::new();
     *vcs.head_sha_val.borrow_mut() = Some("old".to_string());
     *vcs.post_pull_sha.borrow_mut() = Some("new".to_string());
-    *vcs.changed_files_val.borrow_mut() = vec![];
+    *vcs.changed_files_val.borrow_mut() = UnitChanges::default();
     let systemd = MockSystemd::new();
     let image_puller = MockImagePuller::new();
 
@@ -374,7 +374,8 @@ fn sync_all_updated_with_changes() {
     let vcs = MockVcs::new();
     *vcs.head_sha_val.borrow_mut() = Some("old".to_string());
     *vcs.post_pull_sha.borrow_mut() = Some("new".to_string());
-    *vcs.changed_files_val.borrow_mut() = vec!["app.container".to_string()];
+    *vcs.changed_files_val.borrow_mut() =
+        UnitChanges::from_present(vec!["app.container".to_string()]);
     let systemd = MockSystemd::new();
     let image_puller = MockImagePuller::new();
 
@@ -397,10 +398,127 @@ fn sync_all_updated_with_changes() {
     };
 
     let result = runner.sync_all(&cd_config);
-    assert_eq!(result.changed_files, vec!["app.container"]);
+    assert_eq!(result.changes.changed, vec!["app.container"]);
+    assert!(result.changes.deleted.is_empty());
     assert_eq!(result.failures, 0);
 
     let stderr = err_buf.captured();
-    assert!(stderr.contains("1 unit(s) changed"));
+    assert!(stderr.contains("1 unit(s) changed, 0 deleted"));
     assert!(stderr.contains("Sync summary: 1 updated repository"));
+}
+
+#[test]
+fn run_once_stops_deleted_units_before_reload() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = TestWriter::new();
+    let err = TestWriter::new();
+    let mut cfg = test_config(&out, &err);
+    cfg.data_dir = tmp.path().to_path_buf();
+
+    let vcs = MockVcs::new();
+    *vcs.head_sha_val.borrow_mut() = Some("old".to_string());
+    *vcs.post_pull_sha.borrow_mut() = Some("new".to_string());
+    *vcs.changed_files_val.borrow_mut() = UnitChanges {
+        changed: vec!["web.container".to_string()],
+        deleted: vec!["gone.container".to_string()],
+    };
+    let systemd = MockSystemd::new();
+    systemd
+        .active_set
+        .borrow_mut()
+        .insert("gone.service".to_string());
+    systemd
+        .enabled_map
+        .borrow_mut()
+        .insert("web.service".to_string(), "enabled".to_string());
+    let image_puller = MockImagePuller::new();
+
+    let repo_dir = tmp.path().join("myrepo");
+    fs::create_dir_all(repo_dir.join(".git")).unwrap();
+
+    let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
+
+    let mut repos = HashMap::new();
+    repos.insert(
+        "myrepo".to_string(),
+        RepoConfig {
+            url: "https://example.com/repo.git".to_string(),
+            branch: None,
+            interval: None,
+        },
+    );
+    let cd_config = CDConfig {
+        repositories: repos,
+    };
+
+    let failures = runner.run_once(&cd_config);
+
+    assert_eq!(failures, 0);
+    assert!(systemd
+        .stopped
+        .borrow()
+        .contains(&"gone.service".to_string()));
+
+    // Ordering: stop must precede daemon-reload, and reload must precede start.
+    let log = systemd.call_log.borrow();
+    let stop_idx = log.iter().position(|s| s == "stop:gone.service").unwrap();
+    let reload_idx = log.iter().position(|s| s == "reload").unwrap();
+    let start_idx = log.iter().position(|s| s == "start:web.service").unwrap();
+    assert!(
+        stop_idx < reload_idx,
+        "stop must run before daemon-reload; log: {log:?}"
+    );
+    assert!(
+        reload_idx < start_idx,
+        "daemon-reload must run before start; log: {log:?}"
+    );
+
+    let stderr = err.captured();
+    assert!(stderr.contains("Deleted units: gone.container"));
+}
+
+#[test]
+fn run_once_sync_only_does_not_stop_deleted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = TestWriter::new();
+    let err = TestWriter::new();
+    let mut cfg = test_config(&out, &err);
+    cfg.data_dir = tmp.path().to_path_buf();
+
+    let vcs = MockVcs::new();
+    *vcs.head_sha_val.borrow_mut() = Some("old".to_string());
+    *vcs.post_pull_sha.borrow_mut() = Some("new".to_string());
+    *vcs.changed_files_val.borrow_mut() = UnitChanges {
+        changed: vec![],
+        deleted: vec!["gone.container".to_string()],
+    };
+    let systemd = MockSystemd::new();
+    systemd
+        .active_set
+        .borrow_mut()
+        .insert("gone.service".to_string());
+    let image_puller = MockImagePuller::new();
+
+    let repo_dir = tmp.path().join("myrepo");
+    fs::create_dir_all(repo_dir.join(".git")).unwrap();
+
+    let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller).sync_only(true);
+
+    let mut repos = HashMap::new();
+    repos.insert(
+        "myrepo".to_string(),
+        RepoConfig {
+            url: "https://example.com/repo.git".to_string(),
+            branch: None,
+            interval: None,
+        },
+    );
+    let cd_config = CDConfig {
+        repositories: repos,
+    };
+
+    runner.run_once(&cd_config);
+
+    assert!(systemd.stopped.borrow().is_empty());
+    assert!(!*systemd.reload_called.borrow());
 }

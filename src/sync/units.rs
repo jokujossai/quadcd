@@ -154,6 +154,76 @@ pub(crate) fn activate_changed_units_inner(
     }
 }
 
+/// Stop units whose backing files were deleted from the repo.
+///
+/// Must be called **before** `daemon-reload`: once systemd no longer sees the
+/// unit file, `systemctl stop` cannot reach the running container/process and
+/// it becomes orphaned.
+///
+/// - **Templates** (`foo@.service`): every running instance is stopped.
+/// - **Regular units**: stopped only if currently active.
+pub(crate) fn stop_deleted_units_inner(
+    systemd: &dyn SystemdTrait,
+    deleted_files: &[String],
+    cfg: &Config,
+) {
+    let mut units: Vec<String> = deleted_files
+        .iter()
+        .map(|f| unit_name_for_restart(f))
+        .collect();
+    units.sort();
+    units.dedup();
+
+    if units.is_empty() {
+        return;
+    }
+
+    let mut to_stop: Vec<String> = Vec::new();
+
+    for unit in &units {
+        if is_template_unit(unit) {
+            let pattern = unit.replace("@.", "@*.");
+            let instances = systemd.list_units_matching(&pattern, cfg);
+            if cfg.verbose {
+                if instances.is_empty() {
+                    let _ = writeln!(
+                        cfg.output.err(),
+                        "[quadcd] Template {unit}: no running instances to stop"
+                    );
+                } else {
+                    let _ = writeln!(
+                        cfg.output.err(),
+                        "[quadcd] Template {unit}: stopping instances: {}",
+                        instances.join(", ")
+                    );
+                }
+            }
+            to_stop.extend(instances);
+            continue;
+        }
+
+        if systemd.is_active(unit, cfg) {
+            to_stop.push(unit.clone());
+        } else if cfg.verbose {
+            let _ = writeln!(
+                cfg.output.err(),
+                "[quadcd] Not stopping deleted {unit} (not active)"
+            );
+        }
+    }
+
+    if !to_stop.is_empty() {
+        if cfg.verbose {
+            let _ = writeln!(
+                cfg.output.err(),
+                "[quadcd] Stopping deleted units: {}",
+                to_stop.join(", ")
+            );
+        }
+        systemd.stop(&to_stop, cfg);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +543,125 @@ mod tests {
         let stderr = err_buf.captured();
         assert!(stderr.contains("Restarting units"));
         assert!(stderr.contains("app.service"));
+    }
+
+    // stop_deleted_units_inner
+
+    #[test]
+    fn stop_deleted_units_inner_stops_active_units() {
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("data-volume.service".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        stop_deleted_units_inner(
+            &systemd,
+            &["app.container".to_string(), "data.volume".to_string()],
+            &cfg,
+        );
+
+        let stopped = systemd.stopped.borrow();
+        assert_eq!(stopped.len(), 2);
+        assert!(stopped.contains(&"app.service".to_string()));
+        assert!(stopped.contains(&"data-volume.service".to_string()));
+    }
+
+    #[test]
+    fn stop_deleted_units_inner_skips_inactive() {
+        let systemd = MockSystemd::new();
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        stop_deleted_units_inner(&systemd, &["gone.container".to_string()], &cfg);
+
+        assert!(systemd.stopped.borrow().is_empty());
+    }
+
+    #[test]
+    fn stop_deleted_units_inner_empty_does_nothing() {
+        let systemd = MockSystemd::new();
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        stop_deleted_units_inner(&systemd, &[], &cfg);
+
+        assert!(systemd.stopped.borrow().is_empty());
+    }
+
+    #[test]
+    fn stop_deleted_units_inner_template_stops_all_instances() {
+        let systemd = MockSystemd::new();
+        systemd.listed_units.borrow_mut().insert(
+            "myapp@*.service".to_string(),
+            vec![
+                "myapp@web.service".to_string(),
+                "myapp@worker.service".to_string(),
+            ],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        stop_deleted_units_inner(&systemd, &["myapp@.container".to_string()], &cfg);
+
+        let stopped = systemd.stopped.borrow();
+        assert!(stopped.contains(&"myapp@web.service".to_string()));
+        assert!(stopped.contains(&"myapp@worker.service".to_string()));
+    }
+
+    #[test]
+    fn stop_deleted_units_inner_deduplicates() {
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        // Same generated unit shows up twice (e.g. .container and .service
+        // entries that both map to app.service).
+        stop_deleted_units_inner(
+            &systemd,
+            &[
+                "app.container".to_string(),
+                "app.service".to_string(),
+                "app.container".to_string(),
+            ],
+            &cfg,
+        );
+
+        let stopped = systemd.stopped.borrow();
+        assert_eq!(stopped.len(), 1);
+        assert!(stopped.contains(&"app.service".to_string()));
+    }
+
+    #[test]
+    fn stop_deleted_units_inner_verbose_logs() {
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        let err_buf = crate::output::tests::TestWriter::new();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
+        cfg.verbose = true;
+
+        stop_deleted_units_inner(
+            &systemd,
+            &["app.container".to_string(), "skip.container".to_string()],
+            &cfg,
+        );
+
+        let stderr = err_buf.captured();
+        assert!(
+            stderr.contains("Stopping deleted units"),
+            "expected stop log in: {stderr}"
+        );
+        assert!(
+            stderr.contains("Not stopping deleted skip.service"),
+            "expected skip log in: {stderr}"
+        );
     }
 }

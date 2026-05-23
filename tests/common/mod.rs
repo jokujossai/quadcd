@@ -1,6 +1,6 @@
 //! Shared test infrastructure for integration tests.
 
-use quadcd::sync::{ImagePuller, ImageRef, SystemdTrait, Vcs};
+use quadcd::sync::{ImagePuller, ImageRef, SystemdTrait, UnitChanges, Vcs};
 use quadcd::{App, Config, Generator};
 use std::cell::RefCell;
 use std::io;
@@ -50,8 +50,8 @@ impl Vcs for NoopVcs {
     fn head_sha(&self, _repo_dir: &Path) -> Option<String> {
         None
     }
-    fn changed_files(&self, _repo_dir: &Path, _old: &str, _new: &str) -> Vec<String> {
-        Vec::new()
+    fn changed_files(&self, _repo_dir: &Path, _old: &str, _new: &str) -> UnitChanges {
+        UnitChanges::default()
     }
     fn remote_url(&self, _repo_dir: &Path) -> Result<String, String> {
         Ok(String::new())
@@ -80,6 +80,7 @@ impl SystemdTrait for NoopSystemd {
     fn daemon_reload(&self, _cfg: &Config) {}
     fn restart(&self, _units: &[String], _cfg: &Config) {}
     fn start(&self, _units: &[String], _cfg: &Config) {}
+    fn stop(&self, _units: &[String], _cfg: &Config) {}
     fn is_enabled(&self, _unit: &str, _cfg: &Config) -> String {
         "disabled".into()
     }

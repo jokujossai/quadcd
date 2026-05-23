@@ -5,6 +5,7 @@ use crate::cd_config::RepoConfig;
 use crate::config::Config;
 
 use super::units::all_unit_files;
+use super::vcs::UnitChanges;
 use super::Vcs;
 
 /// Result of syncing a single repository.
@@ -12,8 +13,8 @@ use super::Vcs;
 pub enum SyncStatus {
     /// Fresh clone — all unit files are new.
     Cloned,
-    /// Pulled or force-updated — `changed_files` lists what changed.
-    Updated { changed_files: Vec<String> },
+    /// Pulled or force-updated — `changes` lists what changed and what was deleted.
+    Updated { changes: UnitChanges },
     /// HEAD unchanged.
     AlreadyUpToDate,
 }
@@ -44,10 +45,10 @@ pub(crate) fn safe_repo_dir(data_dir: &Path, name: &str) -> Result<PathBuf, Stri
 }
 
 /// Result of syncing all configured repositories.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SyncResult {
-    /// Unit files that changed across all repos.
-    pub changed_files: Vec<String>,
+    /// Unit files that changed (added/modified) or were deleted across all repos.
+    pub changes: UnitChanges,
     /// Number of repositories that failed to sync.
     pub failures: usize,
 }
@@ -121,20 +122,18 @@ pub(crate) fn sync_repo_inner(
         vcs.reset_hard(repo_dir, &branch)?;
 
         let post_sha = vcs.head_sha(repo_dir);
-        let files = if url_changed {
+        let changes = if url_changed {
             // Histories are unrelated after a URL change; git diff is unreliable.
-            all_unit_files(repo_dir)
+            UnitChanges::from_present(all_unit_files(repo_dir))
         } else {
             match (pre_sha.as_deref(), post_sha.as_deref()) {
                 (Some(old), Some(new)) if old != new => vcs.changed_files(repo_dir, old, new),
                 (Some(old), Some(new)) if old == new => return Ok(SyncStatus::AlreadyUpToDate),
-                _ => all_unit_files(repo_dir),
+                _ => UnitChanges::from_present(all_unit_files(repo_dir)),
             }
         };
 
-        return Ok(SyncStatus::Updated {
-            changed_files: files,
-        });
+        return Ok(SyncStatus::Updated { changes });
     }
 
     // Normal pull --ff-only
@@ -152,14 +151,11 @@ pub(crate) fn sync_repo_inner(
     let post_sha = vcs.head_sha(repo_dir);
     match (pre_sha.as_deref(), post_sha.as_deref()) {
         (Some(old), Some(new)) if old == new => Ok(SyncStatus::AlreadyUpToDate),
-        (Some(old), Some(new)) => {
-            let files = vcs.changed_files(repo_dir, old, new);
-            Ok(SyncStatus::Updated {
-                changed_files: files,
-            })
-        }
+        (Some(old), Some(new)) => Ok(SyncStatus::Updated {
+            changes: vcs.changed_files(repo_dir, old, new),
+        }),
         _ => Ok(SyncStatus::Updated {
-            changed_files: all_unit_files(repo_dir),
+            changes: UnitChanges::from_present(all_unit_files(repo_dir)),
         }),
     }
 }
@@ -253,12 +249,35 @@ mod tests {
 
         *vcs.head_sha_val.borrow_mut() = Some("old_sha".to_string());
         *vcs.post_pull_sha.borrow_mut() = Some("new_sha".to_string());
-        *vcs.changed_files_val.borrow_mut() = vec!["app.container".to_string()];
+        *vcs.changed_files_val.borrow_mut() =
+            UnitChanges::from_present(vec!["app.container".to_string()]);
         let result = fixture.sync().unwrap();
 
         match result {
-            SyncStatus::Updated { changed_files } => {
-                assert_eq!(changed_files, vec!["app.container"]);
+            SyncStatus::Updated { changes } => {
+                assert_eq!(changes.changed, vec!["app.container"]);
+                assert!(changes.deleted.is_empty());
+            }
+            _ => panic!("expected Updated"),
+        }
+    }
+
+    #[rstest]
+    fn sync_repo_existing_updated_with_deletions(fixture: SyncRepoFixture) {
+        let vcs = &fixture.vcs;
+
+        *vcs.head_sha_val.borrow_mut() = Some("old_sha".to_string());
+        *vcs.post_pull_sha.borrow_mut() = Some("new_sha".to_string());
+        *vcs.changed_files_val.borrow_mut() = UnitChanges {
+            changed: vec!["new.container".to_string()],
+            deleted: vec!["gone.container".to_string()],
+        };
+        let result = fixture.sync().unwrap();
+
+        match result {
+            SyncStatus::Updated { changes } => {
+                assert_eq!(changes.changed, vec!["new.container"]);
+                assert_eq!(changes.deleted, vec!["gone.container"]);
             }
             _ => panic!("expected Updated"),
         }
@@ -293,13 +312,14 @@ mod tests {
 
         *vcs.head_sha_val.borrow_mut() = Some("old".to_string());
         *vcs.post_pull_sha.borrow_mut() = Some("new".to_string());
-        *vcs.changed_files_val.borrow_mut() = vec!["x.service".to_string()];
+        *vcs.changed_files_val.borrow_mut() =
+            UnitChanges::from_present(vec!["x.service".to_string()]);
         fixture.cfg.force = true;
 
         let result = fixture.sync().unwrap();
         match result {
-            SyncStatus::Updated { changed_files } => {
-                assert_eq!(changed_files, vec!["x.service"]);
+            SyncStatus::Updated { changes } => {
+                assert_eq!(changes.changed, vec!["x.service"]);
             }
             _ => panic!("expected Updated"),
         }
@@ -404,8 +424,9 @@ mod tests {
 
         let result = fixture.sync().unwrap();
         match result {
-            SyncStatus::Updated { changed_files } => {
-                assert!(changed_files.contains(&"app.container".to_string()));
+            SyncStatus::Updated { changes } => {
+                assert!(changes.changed.contains(&"app.container".to_string()));
+                assert!(changes.deleted.is_empty());
             }
             _ => panic!("expected Updated with all_unit_files fallback"),
         }
@@ -423,8 +444,9 @@ mod tests {
 
         let result = fixture.sync().unwrap();
         match result {
-            SyncStatus::Updated { changed_files } => {
-                assert!(changed_files.contains(&"web.service".to_string()));
+            SyncStatus::Updated { changes } => {
+                assert!(changes.changed.contains(&"web.service".to_string()));
+                assert!(changes.deleted.is_empty());
             }
             _ => panic!("expected Updated with all_unit_files fallback"),
         }

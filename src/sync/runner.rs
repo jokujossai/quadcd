@@ -17,8 +17,8 @@ use crate::install;
 use super::image::{dedup_images, extract_images, ImagePuller, ImageRef};
 use super::repo::{safe_repo_dir, sync_repo_inner, SyncResult, SyncStatus};
 use super::systemd::SystemdTrait;
-use super::units::{activate_changed_units_inner, all_unit_files};
-use super::vcs::Vcs;
+use super::units::{activate_changed_units_inner, all_unit_files, stop_deleted_units_inner};
+use super::vcs::{UnitChanges, Vcs};
 
 #[derive(Default)]
 struct SyncOutcomeSummary {
@@ -170,10 +170,18 @@ impl<'a> SyncRunner<'a> {
         activate_changed_units_inner(self.systemd, changed_files, self.cfg);
     }
 
+    /// Stop units whose backing files were deleted by the sync.
+    ///
+    /// Must run **before** `daemon-reload`, while systemd still knows about
+    /// the units; otherwise the running containers/services become orphaned.
+    pub(crate) fn stop_deleted_units(&self, deleted_files: &[String]) {
+        stop_deleted_units_inner(self.systemd, deleted_files, self.cfg);
+    }
+
     /// Sync all configured repositories. Returns changed unit files and a
     /// count of repos that failed to sync.
     pub fn sync_all(&self, cd_config: &CDConfig) -> SyncResult {
-        let mut all_changed = Vec::new();
+        let mut all_changes = UnitChanges::default();
         let mut failures: usize = 0;
         let mut summary = SyncOutcomeSummary::default();
 
@@ -200,15 +208,16 @@ impl<'a> SyncRunner<'a> {
                 Ok(SyncStatus::Cloned) => {
                     summary.cloned += 1;
                     let _ = writeln!(self.cfg.output.err(), "[quadcd] Cloned repository '{name}'");
-                    all_changed.extend(all_unit_files(&repo_dir));
+                    all_changes.changed.extend(all_unit_files(&repo_dir));
                 }
-                Ok(SyncStatus::Updated { changed_files }) => {
+                Ok(SyncStatus::Updated { changes }) => {
                     summary.updated += 1;
-                    if !changed_files.is_empty() {
+                    if !changes.is_empty() {
                         let _ = writeln!(
                             self.cfg.output.err(),
-                            "[quadcd] Updated repository '{name}' ({} unit(s) changed)",
-                            changed_files.len()
+                            "[quadcd] Updated repository '{name}' ({} unit(s) changed, {} deleted)",
+                            changes.changed.len(),
+                            changes.deleted.len()
                         );
                     } else {
                         let _ = writeln!(
@@ -216,7 +225,7 @@ impl<'a> SyncRunner<'a> {
                             "[quadcd] Updated repository '{name}' (no unit files changed)"
                         );
                     }
-                    all_changed.extend(changed_files);
+                    all_changes.extend(changes);
                 }
                 Ok(SyncStatus::AlreadyUpToDate) => {
                     summary.up_to_date += 1;
@@ -241,36 +250,51 @@ impl<'a> SyncRunner<'a> {
         summary.log(self.cfg, "Sync summary");
 
         SyncResult {
-            changed_files: all_changed,
+            changes: all_changes,
             failures,
         }
     }
 
-    /// Reload units after a sync: daemon-reload, pre-pull images, restart units.
+    /// Reload units after a sync.
     ///
-    /// No-op when `changed_files` is empty. In sync-only mode, logs changed
-    /// files but skips daemon-reload and restarts.
-    fn apply_changes(&self, changed_files: &[String]) {
-        if changed_files.is_empty() {
+    /// Order matters: deleted units must be stopped **before** `daemon-reload`
+    /// so systemd can still locate them; otherwise the underlying containers
+    /// or processes become orphaned. After the reload, images for changed
+    /// units are pre-pulled and the changed units are started or restarted.
+    ///
+    /// No-op when `changes` is empty. In sync-only mode, logs the changes but
+    /// skips all systemd interaction.
+    fn apply_changes(&self, changes: &UnitChanges) {
+        if changes.is_empty() {
             return;
         }
-        let _ = writeln!(
-            self.cfg.output.err(),
-            "[quadcd] Changed units: {}",
-            changed_files.join(", ")
-        );
+        if !changes.changed.is_empty() {
+            let _ = writeln!(
+                self.cfg.output.err(),
+                "[quadcd] Changed units: {}",
+                changes.changed.join(", ")
+            );
+        }
+        if !changes.deleted.is_empty() {
+            let _ = writeln!(
+                self.cfg.output.err(),
+                "[quadcd] Deleted units: {}",
+                changes.deleted.join(", ")
+            );
+        }
         if self.sync_only {
             return;
         }
+        self.stop_deleted_units(&changes.deleted);
         self.systemd.daemon_reload(self.cfg);
-        self.pre_pull_images(changed_files);
-        self.restart_changed_units(changed_files);
+        self.pre_pull_images(&changes.changed);
+        self.restart_changed_units(&changes.changed);
     }
 
     /// One-shot sync: sync all repos, daemon-reload, then restart changed units.
     pub fn run_once(&self, cd_config: &CDConfig) -> usize {
         let result = self.sync_all(cd_config);
-        self.apply_changes(&result.changed_files);
+        self.apply_changes(&result.changes);
         result.failures
     }
 
@@ -309,7 +333,7 @@ impl<'a> SyncRunner<'a> {
         match install::acquire_sync_lock(&self.cfg.data_dir) {
             Ok(lock) => {
                 let result = self.sync_all(&cd_config);
-                self.apply_changes(&result.changed_files);
+                self.apply_changes(&result.changes);
                 if result.failures > 0 {
                     let _ = writeln!(
                         self.cfg.output.err(),
@@ -529,12 +553,13 @@ impl<'a> SyncRunner<'a> {
                     );
                 }
                 let result = self.sync_all(&new_config);
-                self.apply_changes(&result.changed_files);
+                self.apply_changes(&result.changes);
                 if self.cfg.verbose {
                     let _ = writeln!(
                         self.cfg.output.err(),
-                        "[quadcd] Config reload sync complete ({} changed, {} failed)",
-                        result.changed_files.len(),
+                        "[quadcd] Config reload sync complete ({} changed, {} deleted, {} failed)",
+                        result.changes.changed.len(),
+                        result.changes.deleted.len(),
                         result.failures
                     );
                 }
@@ -632,7 +657,7 @@ impl<'a> SyncRunner<'a> {
 
         // Check per-repo intervals
         let now = Instant::now();
-        let mut interval_changed: Vec<String> = Vec::new();
+        let mut interval_changes = UnitChanges::default();
         let mut failures: usize = 0;
         let mut summary = SyncOutcomeSummary::default();
         for (name, repo_config) in &current_config.repositories {
@@ -666,18 +691,19 @@ impl<'a> SyncRunner<'a> {
                                 self.cfg.output.err(),
                                 "[quadcd] Cloned repository '{name}'"
                             );
-                            interval_changed.extend(all_unit_files(&repo_dir));
+                            interval_changes.changed.extend(all_unit_files(&repo_dir));
                         }
-                        Ok(SyncStatus::Updated { changed_files }) => {
+                        Ok(SyncStatus::Updated { changes }) => {
                             summary.updated += 1;
-                            if !changed_files.is_empty() {
+                            if !changes.is_empty() {
                                 let _ = writeln!(
                                     self.cfg.output.err(),
-                                    "[quadcd] Synced repository '{name}' ({} unit(s) changed)",
-                                    changed_files.len()
+                                    "[quadcd] Synced repository '{name}' ({} unit(s) changed, {} deleted)",
+                                    changes.changed.len(),
+                                    changes.deleted.len()
                                 );
                             }
-                            interval_changed.extend(changed_files);
+                            interval_changes.extend(changes);
                         }
                         Ok(SyncStatus::AlreadyUpToDate) => {
                             summary.up_to_date += 1;
@@ -702,7 +728,7 @@ impl<'a> SyncRunner<'a> {
             }
         }
 
-        self.apply_changes(&interval_changed);
+        self.apply_changes(&interval_changes);
         summary.log(self.cfg, "Service tick summary");
         failures
     }
@@ -783,7 +809,8 @@ mod tests {
         let vcs = MockVcs::new();
         *vcs.head_sha_val.borrow_mut() = Some("old".to_string());
         *vcs.post_pull_sha.borrow_mut() = Some("new".to_string());
-        *vcs.changed_files_val.borrow_mut() = vec!["app.container".to_string()];
+        *vcs.changed_files_val.borrow_mut() =
+            UnitChanges::from_present(vec!["app.container".to_string()]);
         let systemd = MockSystemd::new();
         let image_puller = MockImagePuller::new();
 
