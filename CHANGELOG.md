@@ -6,6 +6,7 @@
 
 - Reserved `${QUADCD_REPO_ROOT}` substitution variable resolving to the absolute path of each source directory, allowing repo-relative paths in `Volume=`, `EnvironmentFile=`, and other unit-file directives. User `.env` files cannot override it.
 - `PodmanArgs=` values in `.image` files are now forwarded to `podman pull` (all args are pull-valid per the quadlet spec). In `.container` files, only pull-compatible flags are forwarded: `--authfile`, `--tls-verify`, `--creds`, `--cert-dir`, `--os`, `--arch`, `--variant`, `--platform`, and `--decryption-key`; runtime-only flags are silently ignored.
+- Post-restart state reporting: after each `systemctl start`/`restart`, sync queries the unit's `ActiveState`/`SubState` via `systemctl show` and logs one line per unit (e.g. `app.service: active (running)` or `app.service: failed (failed)`). When any unit ends up in a non-`active`/`activating` state, an aggregated `N service(s) failed after restart: …` summary is emitted so operators see broken deployments immediately instead of relying on the no-op success of `systemctl restart`.
 
 ### Changed
 
