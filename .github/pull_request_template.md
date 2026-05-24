@@ -20,3 +20,4 @@
 - [ ] `cargo fmt` passes
 - [ ] `cargo clippy -- -D warnings` passes
 - [ ] `cargo test` passes
+- [ ] `CHANGELOG.md` updated under `[Unreleased]` (or N/A for CI/docs-only changes)
