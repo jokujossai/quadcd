@@ -5,12 +5,18 @@ use std::time::Duration;
 
 use crate::config::Config;
 
-use super::{RepoState, RepoStatus, ServiceStatus, StatusReport};
+use super::{Mode, RepoState, RepoStatus, ServiceStatus, StatusReport};
+
+fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::User => "user",
+        Mode::System => "system",
+    }
+}
 
 pub(crate) fn write_json(report: &StatusReport, cfg: &Config) -> io::Result<()> {
     let mut out = cfg.output.out();
-    let json = serde_json::to_string_pretty(report)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(report).map_err(io::Error::other)?;
     writeln!(out, "{json}")?;
     Ok(())
 }
@@ -25,7 +31,8 @@ pub(crate) fn write_plain(report: &StatusReport, cfg: &Config) -> io::Result<()>
     writeln!(
         out,
         "Repositories (mode: {}, config: {})",
-        report.mode, config_label
+        mode_label(report.mode),
+        config_label
     )?;
     if report.repos.is_empty() {
         writeln!(out, "  (none configured)")?;
@@ -51,32 +58,39 @@ pub(crate) fn write_plain(report: &StatusReport, cfg: &Config) -> io::Result<()>
     writeln!(out, "Services")?;
     if report.services.is_empty() {
         writeln!(out, "  (no managed units found)")?;
-        return Ok(());
-    }
-
-    writeln!(
-        out,
-        "  {:<28} {:<10} {:<10} {:<10} {:<7} {:<8} {:>4} {:<10} NOTE",
-        "UNIT", "ACTIVE", "SUB", "ENABLED", "RELOAD", "RESTART", "N", "UPTIME"
-    )?;
-    for s in &report.services {
+    } else {
         writeln!(
             out,
-            "  {:<28} {:<10} {:<10} {:<10} {:<7} {:<8} {:>4} {:<10} {}",
-            truncate(&s.unit, 28),
-            truncate(&s.active_state, 10),
-            truncate(&s.sub_state, 10),
-            truncate(&s.enabled, 10),
-            if s.needs_daemon_reload {
-                "needed"
-            } else {
-                "ok"
-            },
-            if s.restart_pending { "pending" } else { "ok" },
-            s.n_restarts,
-            format_uptime(s.uptime),
-            service_note(s),
+            "  {:<28} {:<10} {:<10} {:<10} {:<7} {:<8} {:>4} {:<10} NOTE",
+            "UNIT", "ACTIVE", "SUB", "ENABLED", "RELOAD", "RESTART", "N", "UPTIME"
         )?;
+        for s in &report.services {
+            writeln!(
+                out,
+                "  {:<28} {:<10} {:<10} {:<10} {:<7} {:<8} {:>4} {:<10} {}",
+                truncate(&s.unit, 28),
+                truncate(&s.active_state, 10),
+                truncate(&s.sub_state, 10),
+                truncate(&s.enabled, 10),
+                if s.needs_daemon_reload {
+                    "needed"
+                } else {
+                    "ok"
+                },
+                if s.restart_pending { "pending" } else { "ok" },
+                s.n_restarts,
+                format_uptime(s.uptime),
+                service_note(s),
+            )?;
+        }
+    }
+
+    if !report.warnings.is_empty() {
+        writeln!(out)?;
+        writeln!(out, "Warnings")?;
+        for w in &report.warnings {
+            writeln!(out, "  - {w}")?;
+        }
     }
     Ok(())
 }
@@ -153,7 +167,7 @@ mod tests {
 
     fn sample_report() -> StatusReport {
         StatusReport {
-            mode: "user".to_string(),
+            mode: Mode::User,
             config_path: Some(PathBuf::from("/etc/quadcd.toml")),
             repos: vec![RepoStatus {
                 name: "app".to_string(),
@@ -178,6 +192,7 @@ mod tests {
                 uptime: Some(Duration::from_secs(3600 + 120)),
                 restart_loop_suspected: false,
             }],
+            warnings: Vec::new(),
         }
     }
 
@@ -207,6 +222,18 @@ mod tests {
         assert_eq!(v["repos"][0]["state"]["state"], "up-to-date");
         assert_eq!(v["services"][0]["unit"], "web.service");
         assert_eq!(v["services"][0]["uptime"], 3720);
+    }
+
+    #[test]
+    fn warnings_section_rendered_when_present() {
+        let mut report = sample_report();
+        report.warnings = vec!["something fishy".to_string()];
+        let stdout_buf = crate::output::tests::TestWriter::new();
+        let cfg = crate::config::test_config(Box::new(stdout_buf.clone()), Box::new(Vec::new()));
+        write_plain(&report, &cfg).unwrap();
+        let out = stdout_buf.captured();
+        assert!(out.contains("Warnings"), "out: {out}");
+        assert!(out.contains("something fishy"), "out: {out}");
     }
 
     #[test]

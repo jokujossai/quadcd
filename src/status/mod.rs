@@ -8,7 +8,6 @@
 
 mod render;
 
-use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -38,10 +37,20 @@ pub struct StatusOptions {
 /// Aggregated status of every configured repo + every managed service.
 #[derive(Debug, Serialize)]
 pub struct StatusReport {
-    pub mode: String,
+    pub mode: Mode,
     pub config_path: Option<PathBuf>,
     pub repos: Vec<RepoStatus>,
     pub services: Vec<ServiceStatus>,
+    /// Non-fatal observations that don't affect the exit code (e.g. duplicate
+    /// unit names across repos, or a repo with local-only commits).
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    User,
+    System,
 }
 
 #[derive(Debug, Serialize)]
@@ -68,8 +77,12 @@ pub enum RepoState {
 }
 
 impl RepoState {
+    /// True if the state should drive a non-zero exit code. `Ahead` is treated
+    /// as a warning, not a problem: on a dev `--user` machine local commits
+    /// are normal, and a CD host that finds local commits should still
+    /// distinguish that from "out of date" or "broken".
     pub fn is_problem(&self) -> bool {
-        !matches!(self, RepoState::UpToDate)
+        !matches!(self, RepoState::UpToDate | RepoState::Ahead { .. })
     }
 }
 
@@ -85,7 +98,7 @@ pub struct ServiceStatus {
     pub needs_daemon_reload: bool,
     pub restart_pending: bool,
     pub n_restarts: u32,
-    #[serde(serialize_with = "ser_duration_secs")]
+    #[serde(serialize_with = "ser_optional_duration_secs")]
     pub uptime: Option<Duration>,
     pub restart_loop_suspected: bool,
 }
@@ -99,7 +112,10 @@ impl ServiceStatus {
     }
 }
 
-fn ser_duration_secs<S: serde::Serializer>(d: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+fn ser_optional_duration_secs<S: serde::Serializer>(
+    d: &Option<Duration>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
     match d {
         Some(d) => s.serialize_some(&d.as_secs()),
         None => s.serialize_none(),
@@ -168,14 +184,22 @@ pub(crate) fn collect(
     now_monotonic_us: u64,
     now_system: SystemTime,
 ) -> StatusReport {
-    let mode = if cfg.is_user_mode { "user" } else { "system" };
+    let mode = if cfg.is_user_mode {
+        Mode::User
+    } else {
+        Mode::System
+    };
 
     let mut repo_names: Vec<&String> = cd_config.repositories.keys().collect();
     repo_names.sort();
 
     let mut repos = Vec::with_capacity(repo_names.len());
     let mut services = Vec::new();
-    let mut seen_units: BTreeSet<String> = BTreeSet::new();
+    let mut warnings: Vec<String> = Vec::new();
+    // Maps unit name → first repo that claimed it, so a duplicate can name
+    // both sides in its warning.
+    let mut seen_units: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
 
     for name in repo_names {
         let repo_cfg = &cd_config.repositories[name];
@@ -197,20 +221,26 @@ pub(crate) fn collect(
 
         let repo_status = collect_repo_status(name, repo_cfg, &repo_dir, vcs, opts);
 
-        // Enumerate units only when the working tree exists.
-        if matches!(
-            repo_status.state,
-            RepoState::UpToDate
-                | RepoState::Behind { .. }
-                | RepoState::Ahead { .. }
-                | RepoState::Diverged { .. }
-        ) || repo_dir.join(".git").exists()
-        {
+        if let RepoState::Ahead { commits } = repo_status.state {
+            warnings.push(format!(
+                "repo '{name}' has {commits} local commit(s) not on origin"
+            ));
+        }
+
+        // Enumerate units whenever the working tree exists. Any state other
+        // than `Missing` implies `.git` was present when `collect_repo_status`
+        // checked, so the `.git` re-check covers both error states (URL
+        // mismatch, fetch failure, rev-list failure) and clean states.
+        if repo_dir.join(".git").exists() {
             for filename in all_unit_files(&repo_dir) {
                 let unit = unit_name_for_restart(&filename);
-                if !seen_units.insert(unit.clone()) {
+                if let Some(prev) = seen_units.get(&unit) {
+                    warnings.push(format!(
+                        "unit '{unit}' is defined in both '{prev}' and '{name}'; only the copy from '{prev}' is shown"
+                    ));
                     continue;
                 }
+                seen_units.insert(unit.clone(), name.clone());
                 let source_file = repo_dir.join(&filename);
                 let state = systemd.show_state(&unit, cfg);
                 let enabled = systemd.is_enabled(&unit, cfg);
@@ -230,10 +260,11 @@ pub(crate) fn collect(
     }
 
     StatusReport {
-        mode: mode.to_string(),
+        mode,
         config_path: cfg.config_path.clone(),
         repos,
         services,
+        warnings,
     }
 }
 
@@ -698,13 +729,26 @@ mod tests {
         assert!(svc.restart_pending, "expected restart_pending: {svc:?}");
     }
 
+    fn repo_status_with_state(state: RepoState) -> RepoStatus {
+        RepoStatus {
+            name: "x".into(),
+            url: "u".into(),
+            branch: "main".into(),
+            local_path: PathBuf::from("/x"),
+            state,
+            fetched: true,
+            head_sha: None,
+        }
+    }
+
     #[test]
     fn report_exit_code_zero_when_clean() {
         let report = StatusReport {
-            mode: "user".into(),
+            mode: Mode::User,
             config_path: None,
             repos: Vec::new(),
             services: Vec::new(),
+            warnings: Vec::new(),
         };
         assert_eq!(report_exit_code(&report), 0);
     }
@@ -712,19 +756,128 @@ mod tests {
     #[test]
     fn report_exit_code_nonzero_on_behind_repo() {
         let report = StatusReport {
-            mode: "user".into(),
+            mode: Mode::User,
             config_path: None,
-            repos: vec![RepoStatus {
-                name: "x".into(),
-                url: "u".into(),
-                branch: "main".into(),
-                local_path: PathBuf::from("/x"),
-                state: RepoState::Behind { commits: 1 },
-                fetched: true,
-                head_sha: None,
-            }],
+            repos: vec![repo_status_with_state(RepoState::Behind { commits: 1 })],
             services: Vec::new(),
+            warnings: Vec::new(),
         };
         assert_eq!(report_exit_code(&report), 1);
+    }
+
+    #[test]
+    fn ahead_state_is_not_a_problem() {
+        let report = StatusReport {
+            mode: Mode::User,
+            config_path: None,
+            repos: vec![repo_status_with_state(RepoState::Ahead { commits: 2 })],
+            services: Vec::new(),
+            warnings: Vec::new(),
+        };
+        assert!(!report.repos[0].state.is_problem());
+        assert_eq!(report_exit_code(&report), 0);
+    }
+
+    #[test]
+    fn ahead_repo_emits_warning_but_no_problem_via_collect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        std::fs::create_dir_all(tmp.path().join("app").join(".git")).unwrap();
+        let cd = cd_config_with("app", "https://example.com/repo.git", Some("main"));
+        let vcs = MockVcs::new();
+        *vcs.rev_list_default.borrow_mut() = Ok((4, 0));
+        let systemd = MockSystemd::new();
+        let opts = StatusOptions {
+            no_fetch: true,
+            json: false,
+        };
+        let report = collect(&cfg, &cd, &vcs, &systemd, &opts, 0, SystemTime::now());
+        assert_eq!(report.repos[0].state, RepoState::Ahead { commits: 4 });
+        assert_eq!(report_exit_code(&report), 0);
+        assert!(
+            report.warnings.iter().any(|w| w.contains("4 local commit")),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn diverged_state_from_rev_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+        std::fs::create_dir_all(tmp.path().join("app").join(".git")).unwrap();
+        let cd = cd_config_with("app", "https://example.com/repo.git", Some("main"));
+        let vcs = MockVcs::new();
+        *vcs.rev_list_default.borrow_mut() = Ok((2, 5));
+        let systemd = MockSystemd::new();
+        let opts = StatusOptions {
+            no_fetch: true,
+            json: false,
+        };
+        let report = collect(&cfg, &cd, &vcs, &systemd, &opts, 0, SystemTime::now());
+        assert_eq!(
+            report.repos[0].state,
+            RepoState::Diverged {
+                ahead: 2,
+                behind: 5
+            }
+        );
+        assert_eq!(report_exit_code(&report), 1);
+    }
+
+    #[test]
+    fn duplicate_unit_across_repos_emits_warning_and_keeps_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_data_dir(tmp.path().to_path_buf());
+
+        for repo_name in ["alpha", "beta"] {
+            let dir = tmp.path().join(repo_name);
+            std::fs::create_dir_all(dir.join(".git")).unwrap();
+            std::fs::write(dir.join("dup.container"), "x").unwrap();
+        }
+
+        let mut cd = CDConfig {
+            repositories: HashMap::new(),
+        };
+        for name in ["alpha", "beta"] {
+            cd.repositories.insert(
+                name.to_string(),
+                RepoConfig {
+                    // MockVcs's default `remote_url` returns this exact URL,
+                    // so both repos report up-to-date instead of url-mismatch.
+                    url: "https://example.com/repo.git".to_string(),
+                    branch: Some("main".to_string()),
+                    interval: None,
+                },
+            );
+        }
+
+        let vcs = MockVcs::new();
+        let systemd = MockSystemd::new();
+        let opts = StatusOptions {
+            no_fetch: true,
+            json: false,
+        };
+        let report = collect(
+            &cfg,
+            &cd,
+            &vcs,
+            &systemd,
+            &opts,
+            1_000_000,
+            SystemTime::now(),
+        );
+
+        assert_eq!(report.services.len(), 1);
+        assert_eq!(report.services[0].origin_repo, "alpha");
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|w| w.contains("dup.service") && w.contains("alpha") && w.contains("beta")),
+            "warnings: {:?}",
+            report.warnings
+        );
+        assert_eq!(report_exit_code(&report), 0);
     }
 }
