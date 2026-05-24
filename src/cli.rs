@@ -3,9 +3,10 @@ use std::path::Path;
 
 use crate::output::Output;
 
-pub(crate) const TOP_LEVEL_USAGE: &str = "Usage:\n  quadcd generate [-v] [-no-kmsg-log] [-user] [-dryrun] normal-dir [early-dir] [late-dir]\n  quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i|--interactive] [--user] [-v]\n  quadcd version\n  quadcd help";
+pub(crate) const TOP_LEVEL_USAGE: &str = "Usage:\n  quadcd generate [-v] [-no-kmsg-log] [-user] [-dryrun] normal-dir [early-dir] [late-dir]\n  quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i|--interactive] [--user] [-v]\n  quadcd status [--no-fetch] [--json] [--user] [-v]\n  quadcd version\n  quadcd help";
 pub(crate) const SYNC_USAGE: &str =
     "Usage: quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i|--interactive] [--user] [-v]";
+pub(crate) const STATUS_USAGE: &str = "Usage: quadcd status [--no-fetch] [--json] [--user] [-v]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ParsedCommand {
@@ -13,6 +14,7 @@ pub(crate) enum ParsedCommand {
     Version,
     Generate(GenerateInvocation),
     Sync(SyncInvocation),
+    Status(StatusInvocation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,15 @@ pub(crate) struct SyncInvocation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StatusInvocation {
+    pub(crate) verbose: bool,
+    pub(crate) force_user: bool,
+    pub(crate) no_fetch: bool,
+    pub(crate) json: bool,
+    pub(crate) show_help: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ParseError {
     message: Option<String>,
     usage: ParseUsage,
@@ -49,6 +60,7 @@ enum ParseUsage {
     TopLevel,
     Generate { program: String },
     Sync,
+    Status,
 }
 
 impl ParseError {
@@ -91,6 +103,13 @@ impl ParseError {
         }
     }
 
+    fn status_invalid(arg: &str) -> Self {
+        Self {
+            message: Some(format!("Error: invalid argument for status: {arg}")),
+            usage: ParseUsage::Status,
+        }
+    }
+
     pub(crate) fn emit(&self, output: &Output) {
         if let Some(message) = &self.message {
             let _ = writeln!(output.err(), "{message}");
@@ -108,6 +127,9 @@ impl ParseError {
             }
             ParseUsage::Sync => {
                 let _ = writeln!(output.err(), "{SYNC_USAGE}");
+            }
+            ParseUsage::Status => {
+                let _ = writeln!(output.err(), "{STATUS_USAGE}");
             }
         }
     }
@@ -128,6 +150,7 @@ pub(crate) fn parse_cli(
     match args.get(1).map(|s| s.as_str()) {
         Some("generate") => parse_generate(&args[0], &args[2..]),
         Some("sync") => parse_sync(&args[2..]),
+        Some("status") => parse_status(&args[2..]),
         Some("version") => Ok(ParsedCommand::Version),
         Some("help") | Some("-h") | Some("-help") | Some("--help") => Ok(ParsedCommand::Help),
         Some(other) => Err(ParseError::unknown_subcommand(other)),
@@ -224,6 +247,40 @@ fn parse_sync(args: &[String]) -> Result<ParsedCommand, ParseError> {
         sync_only,
         accept_new_host_keys,
         interactive,
+        show_help: false,
+    }))
+}
+
+fn parse_status(args: &[String]) -> Result<ParsedCommand, ParseError> {
+    let mut verbose = false;
+    let mut force_user = false;
+    let mut no_fetch = false;
+    let mut json = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "-v" => verbose = true,
+            "--user" => force_user = true,
+            "--no-fetch" => no_fetch = true,
+            "--json" => json = true,
+            "-h" | "-help" | "--help" => {
+                return Ok(ParsedCommand::Status(StatusInvocation {
+                    verbose,
+                    force_user,
+                    no_fetch,
+                    json,
+                    show_help: true,
+                }))
+            }
+            _ => return Err(ParseError::status_invalid(arg)),
+        }
+    }
+
+    Ok(ParsedCommand::Status(StatusInvocation {
+        verbose,
+        force_user,
+        no_fetch,
+        json,
         show_help: false,
     }))
 }
@@ -467,6 +524,48 @@ mod tests {
             ParseError {
                 message: Some("Error: invalid argument for sync: --bogus".to_string()),
                 usage: ParseUsage::Sync,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_status_parses_flags() {
+        let args = vec![
+            "-v".to_string(),
+            "--user".to_string(),
+            "--no-fetch".to_string(),
+            "--json".to_string(),
+        ];
+        match parse_status(&args).unwrap() {
+            ParsedCommand::Status(invocation) => {
+                assert!(invocation.verbose);
+                assert!(invocation.force_user);
+                assert!(invocation.no_fetch);
+                assert!(invocation.json);
+                assert!(!invocation.show_help);
+            }
+            other => panic!("expected status invocation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_status_returns_help_invocation() {
+        let args = vec!["--help".to_string()];
+        match parse_status(&args).unwrap() {
+            ParsedCommand::Status(invocation) => assert!(invocation.show_help),
+            other => panic!("expected status invocation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_status_rejects_invalid_flag() {
+        let args = vec!["--bogus".to_string()];
+        let err = parse_status(&args).unwrap_err();
+        assert_eq!(
+            err,
+            ParseError {
+                message: Some("Error: invalid argument for status: --bogus".to_string()),
+                usage: ParseUsage::Status,
             }
         );
     }

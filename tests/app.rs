@@ -779,3 +779,49 @@ fn no_autodetect_when_arg_is_not_directory() {
     assert_eq!(code, 1);
     assert!(err_buf.captured().contains("unknown subcommand"));
 }
+
+// ===========================================================================
+// Status subcommand
+// ===========================================================================
+
+#[test]
+fn status_no_config_exits_one_with_error() {
+    let out_buf = TestWriter::new();
+    let err_buf = TestWriter::new();
+    let vcs = NoopVcs;
+    let systemd = NoopSystemd;
+    let gen = GeneratorImpl {
+        path: true_binary(),
+    };
+    let mut app = make_app(&out_buf, &err_buf, &vcs, &systemd, &gen);
+
+    let code = app.run(&[
+        "quadcd".to_string(),
+        "status".to_string(),
+        "--no-fetch".to_string(),
+    ]);
+
+    assert_eq!(code, 1);
+    assert!(err_buf.captured().contains("no config file found"));
+}
+
+#[test]
+fn status_help_returns_zero() {
+    let out_buf = TestWriter::new();
+    let err_buf = TestWriter::new();
+    let vcs = NoopVcs;
+    let systemd = NoopSystemd;
+    let gen = GeneratorImpl {
+        path: true_binary(),
+    };
+    let mut app = make_app(&out_buf, &err_buf, &vcs, &systemd, &gen);
+
+    let code = app.run(&[
+        "quadcd".to_string(),
+        "status".to_string(),
+        "--help".to_string(),
+    ]);
+
+    assert_eq!(code, 0);
+    assert!(err_buf.captured().contains("quadcd status"));
+}

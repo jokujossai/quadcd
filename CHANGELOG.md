@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `quadcd status [--no-fetch] [--user] [--json] [-v]` subcommand: read-only diagnostic that reports per-repo state (up-to-date / ahead / behind / diverged / url mismatch / missing / error) and per-service systemd state (active/sub/result, enabled, `NeedDaemonReload`, restart-pending, `NRestarts`, uptime, and a restart-loop heuristic). Default fetches; `--no-fetch` skips the network. Exits non-zero on any problem so it is usable from cron/monitoring. `--json` emits a single structured document; without it, a plain-text table is printed.
+
+### Changed
+
+- **Breaking (MSRV):** Minimum Supported Rust Version bumped from 1.70 to 1.74. This matches the toolchain CI builds and tests against, and lets the codebase use `io::Error::other` and other ≥1.74 conveniences. Downstream consumers on Rust 1.70–1.73 will need to upgrade their toolchain.
+
 ## 0.2.0 - 2026-05-23
 
 ### Added

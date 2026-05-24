@@ -585,6 +585,10 @@ mod tests {
             active_state: s.to_string(),
             sub_state: "any".to_string(),
             result: "any".to_string(),
+            need_daemon_reload: false,
+            n_restarts: 0,
+            active_enter_timestamp_monotonic: None,
+            fragment_path: None,
         };
         assert!(!mk("active").is_failure());
         assert!(!mk("activating").is_failure());
@@ -608,6 +612,10 @@ mod tests {
                 active_state: "failed".to_string(),
                 sub_state: "failed".to_string(),
                 result: "exit-code".to_string(),
+                need_daemon_reload: false,
+                n_restarts: 0,
+                active_enter_timestamp_monotonic: None,
+                fragment_path: None,
             },
         );
         let err_buf = crate::output::tests::TestWriter::new();
@@ -642,6 +650,10 @@ mod tests {
                     active_state: "failed".to_string(),
                     sub_state: "failed".to_string(),
                     result: "exit-code".to_string(),
+                    need_daemon_reload: false,
+                    n_restarts: 0,
+                    active_enter_timestamp_monotonic: None,
+                    fragment_path: None,
                 },
             );
         }

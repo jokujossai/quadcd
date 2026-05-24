@@ -24,7 +24,8 @@ pub use runner::SyncRunner;
 pub use systemd::{Systemd, SystemdTrait, UnitState};
 pub use vcs::{GitVcs, UnitChanges, Vcs};
 
-pub(crate) use units::is_unit_file;
+pub(crate) use repo::safe_repo_dir;
+pub(crate) use units::{all_unit_files, is_unit_file, unit_name_for_restart};
 
 /// Re-exports of mock types for integration tests.
 #[cfg(feature = "test-support")]

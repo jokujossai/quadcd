@@ -459,6 +459,7 @@ dependencies = [
  "quadcd",
  "rstest",
  "serde",
+ "serde_json",
  "subprocess",
  "tempfile",
  "toml",

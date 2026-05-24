@@ -57,6 +57,16 @@ pub trait Vcs {
     fn reset_hard(&self, repo_dir: &Path, branch: &str) -> Result<(), String>;
     fn pull_ff_only(&self, repo_dir: &Path, branch: &str) -> Result<(), String>;
     fn default_branch(&self, repo_dir: &Path) -> String;
+    /// Return `(ahead, behind)` commit counts from
+    /// `git rev-list --left-right --count <local>...<remote>`. `ahead` is the
+    /// number of commits reachable from `local` but not `remote`; `behind` is
+    /// the reverse. Errors propagate (e.g. the remote ref does not exist).
+    fn rev_list_left_right(
+        &self,
+        repo_dir: &Path,
+        local: &str,
+        remote: &str,
+    ) -> Result<(usize, usize), String>;
 }
 
 /// VCS implementation backed by a git binary.
@@ -388,6 +398,38 @@ impl Vcs for GitVcs {
         // Step 3: genuine last resort
         "main".to_string()
     }
+
+    fn rev_list_left_right(
+        &self,
+        repo_dir: &Path,
+        local: &str,
+        remote: &str,
+    ) -> Result<(usize, usize), String> {
+        let dir = repo_dir.to_string_lossy();
+        let spec = format!("{local}...{remote}");
+        let output = self.run_git(
+            &["-C", &dir, "rev-list", "--left-right", "--count", &spec],
+            "git rev-list",
+        )?;
+        if !output.success() {
+            return Err(format!(
+                "git rev-list failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let trimmed = stdout.trim();
+        let mut parts = trimmed.split_whitespace();
+        let ahead = parts
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .ok_or_else(|| format!("git rev-list: unparseable output '{trimmed}'"))?;
+        let behind = parts
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .ok_or_else(|| format!("git rev-list: unparseable output '{trimmed}'"))?;
+        Ok((ahead, behind))
+    }
 }
 
 #[cfg(test)]
@@ -528,7 +570,14 @@ pub mod testing {
         pub changed_files_val: RefCell<UnitChanges>,
         pub post_pull_sha: RefCell<Option<String>>,
         pub default_branch_val: String,
+        /// Mock `(ahead, behind)` for `rev_list_left_right`, keyed by
+        /// `"<local>...<remote>"`. Lookup falls back to `rev_list_default`.
+        pub rev_list_map: RefCell<RevListMap>,
+        pub rev_list_default: RefCell<RevListResult>,
     }
+
+    pub type RevListResult = Result<(usize, usize), String>;
+    pub type RevListMap = std::collections::HashMap<String, RevListResult>;
 
     impl MockVcs {
         pub fn new() -> Self {
@@ -543,6 +592,8 @@ pub mod testing {
                 changed_files_val: RefCell::new(UnitChanges::default()),
                 post_pull_sha: RefCell::new(Some("abc123".to_string())),
                 default_branch_val: "main".to_string(),
+                rev_list_map: RefCell::new(std::collections::HashMap::new()),
+                rev_list_default: RefCell::new(Ok((0, 0))),
             }
         }
     }
@@ -591,6 +642,18 @@ pub mod testing {
         }
         fn default_branch(&self, _repo_dir: &Path) -> String {
             self.default_branch_val.clone()
+        }
+        fn rev_list_left_right(
+            &self,
+            _repo_dir: &Path,
+            local: &str,
+            remote: &str,
+        ) -> Result<(usize, usize), String> {
+            let key = format!("{local}...{remote}");
+            if let Some(v) = self.rev_list_map.borrow().get(&key) {
+                return v.clone();
+            }
+            self.rev_list_default.borrow().clone()
         }
     }
 }
