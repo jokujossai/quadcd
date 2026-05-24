@@ -78,6 +78,25 @@ jobs:
           minimum_coverage: 50
           show_line: true
 
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Install cargo-audit and cargo-machete
+        timeout-minutes: 1
+        uses: taiki-e/install-action@7be9fd86bd1707236395105d6e9329dd1511a7e1 # v2.79.0
+        with:
+          tool: cargo-audit,cargo-machete
+      - name: cargo audit
+        id: audit
+        run: cargo audit
+      - name: cargo machete
+        if: ${{ !cancelled() && steps.audit.conclusion != 'skipped' }}
+        run: cargo machete
+
   build:
     permissions:
       contents: read
@@ -182,7 +201,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   release:
-    needs: [build, test, integration-test]
+    needs: [build, test, integration-test, audit]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
