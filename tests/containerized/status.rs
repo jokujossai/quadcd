@@ -166,9 +166,16 @@ fn status_missing_repo_reports_missing_and_exits_one() {
 // Repo state (real sync service)
 // ---------------------------------------------------------------------------
 
+/// Happy-path test: clean state after a successful sync covers four
+/// behaviours that all need the same primed repo, so they are bundled into
+/// one test to keep the integration suite fast:
+///   1. exit code 0 when nothing is wrong,
+///   2. plain-text output has the expected column headers and values,
+///   3. `--json` output is parseable and has all required fields,
+///   4. the managed service is reported as active with no pending reload.
 #[test]
 #[ignore]
-fn status_up_to_date_after_sync_exits_zero() {
+fn status_clean_state_after_sync() {
     let _ctx = SyncTestContext::new();
 
     prime_repo_via_service(
@@ -180,20 +187,77 @@ fn status_up_to_date_after_sync_exits_zero() {
     );
     wait_for_unit_start("hello.service", Duration::from_secs(15));
 
-    let out = run_status(&["--no-fetch"]);
-    let stdout = stdout_str(&out);
+    // (1) + (2): plain-text output and exit code.
+    let plain = run_status(&["--no-fetch"]);
+    let plain_stdout = stdout_str(&plain);
     assert!(
-        out.status.success(),
-        "expected exit 0, got stdout:\n{stdout}\nstderr:\n{}",
-        stderr_str(&out)
+        plain.status.success(),
+        "expected exit 0, got stdout:\n{plain_stdout}\nstderr:\n{}",
+        stderr_str(&plain)
     );
-    assert!(stdout.contains("up-to-date"), "stdout: {stdout}");
-    assert!(stdout.contains("myapp"), "stdout: {stdout}");
+    for needle in [
+        "Repositories",
+        "NAME",
+        "BRANCH",
+        "STATE",
+        "HEAD",
+        "Services",
+        "UNIT",
+        "ACTIVE",
+        "RELOAD",
+        "RESTART",
+        "UPTIME",
+        "NOTE",
+        "up-to-date",
+        "myapp",
+        "hello.service",
+    ] {
+        assert!(
+            plain_stdout.contains(needle),
+            "expected '{needle}' in plain output, got:\n{plain_stdout}"
+        );
+    }
+
+    // (3) + (4): JSON shape and service-state fields.
+    let json = run_status(&["--no-fetch", "--json"]);
+    assert!(
+        json.status.success(),
+        "expected exit 0 for --json, stderr: {}",
+        stderr_str(&json)
+    );
+    let v = parse_status_json(&json);
+    assert!(v["mode"].is_string());
+    assert!(v["repos"].is_array());
+    assert!(v["services"].is_array());
+
+    let repos = v["repos"].as_array().unwrap();
+    assert_eq!(repos.len(), 1);
+    assert_eq!(repos[0]["name"], "myapp");
+    assert_eq!(repos[0]["branch"], "main");
+    assert_eq!(repos[0]["state"]["state"], "up-to-date");
+    assert!(repos[0]["head_sha"].is_string());
+
+    let services = v["services"].as_array().unwrap();
+    let svc = services
+        .iter()
+        .find(|s| s["unit"] == "hello.service")
+        .unwrap_or_else(|| panic!("expected hello.service in {services:?}"))
+        .clone();
+    assert_eq!(svc["active_state"], "active");
+    assert_eq!(svc["result"], "success");
+    assert_eq!(svc["needs_daemon_reload"], false);
+    assert!(svc["enabled"].is_string());
+    assert!(svc["restart_pending"].is_boolean());
+    assert!(svc["restart_loop_suspected"].is_boolean());
+    assert!(svc["n_restarts"].is_number());
 }
 
+/// Default-fetch detects upstream commits and reports `behind N` (plain and
+/// JSON). Pushes two commits so the count itself is exercised, not just the
+/// "non-zero" branch.
 #[test]
 #[ignore]
-fn status_behind_after_upstream_commit_exits_one() {
+fn status_behind_after_upstream_commits() {
     let _ctx = SyncTestContext::new();
 
     let bare = prime_repo_via_service(
@@ -205,16 +269,28 @@ fn status_behind_after_upstream_commit_exits_one() {
     );
     wait_for_unit_start("hello.service", Duration::from_secs(15));
 
-    // Stop the sync service so it can't pull the new upstream commit between
-    // our push and our `quadcd status` call.
+    // Stop the sync service so it can't pull the new upstream commits before
+    // we observe them via `quadcd status`.
     stop_sync_service();
-    push_commit(&bare, &[("extra.txt", "x\n")], "extra commit");
+    push_commit(&bare, &[("a.txt", "1")], "one");
+    push_commit(&bare, &[("b.txt", "2")], "two");
 
-    // Default fetch should observe the new commit and report "behind 1".
-    let out = run_status(&[]);
-    let stdout = stdout_str(&out);
-    assert!(!out.status.success(), "expected exit 1, stdout: {stdout}");
-    assert!(stdout.contains("behind 1"), "stdout: {stdout}");
+    // Plain output reports the count.
+    let plain = run_status(&[]);
+    let plain_stdout = stdout_str(&plain);
+    assert!(
+        !plain.status.success(),
+        "expected exit 1, stdout: {plain_stdout}"
+    );
+    assert!(plain_stdout.contains("behind 2"), "stdout: {plain_stdout}");
+
+    // JSON encodes the tagged variant with `state=behind, commits=2`.
+    let json = run_status(&["--json"]);
+    assert!(!json.status.success());
+    let v = parse_status_json(&json);
+    let state = &v["repos"][0]["state"];
+    assert_eq!(state["state"], "behind");
+    assert_eq!(state["commits"], 2);
 }
 
 #[test]
@@ -279,113 +355,8 @@ fn status_url_mismatch_detected_and_does_not_fetch() {
 }
 
 // ---------------------------------------------------------------------------
-// JSON output
+// Service state — daemon-reload pending, restart pending, restart loop
 // ---------------------------------------------------------------------------
-
-#[test]
-#[ignore]
-fn status_json_is_parseable_and_has_required_fields() {
-    let _ctx = SyncTestContext::new();
-
-    prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
-    wait_for_unit_start("hello.service", Duration::from_secs(15));
-
-    let out = run_status(&["--no-fetch", "--json"]);
-    assert!(
-        out.status.success(),
-        "expected exit 0, stderr: {}",
-        stderr_str(&out)
-    );
-
-    let v = parse_status_json(&out);
-    assert!(v["mode"].is_string());
-    assert!(v["repos"].is_array());
-    assert!(v["services"].is_array());
-
-    let repos = v["repos"].as_array().unwrap();
-    assert_eq!(repos.len(), 1);
-    assert_eq!(repos[0]["name"], "myapp");
-    assert_eq!(repos[0]["branch"], "main");
-    assert_eq!(repos[0]["state"]["state"], "up-to-date");
-    assert!(repos[0]["head_sha"].is_string());
-
-    let services = v["services"].as_array().unwrap();
-    let svc = services
-        .iter()
-        .find(|s| s["unit"] == "hello.service")
-        .unwrap_or_else(|| panic!("expected hello.service in {services:?}"));
-    assert_eq!(svc["active_state"], "active");
-    assert_eq!(svc["needs_daemon_reload"], false);
-    assert!(svc["enabled"].is_string());
-    assert!(svc["restart_pending"].is_boolean());
-    assert!(svc["restart_loop_suspected"].is_boolean());
-    assert!(svc["n_restarts"].is_number());
-}
-
-#[test]
-#[ignore]
-fn status_json_behind_state_carries_commit_count() {
-    let _ctx = SyncTestContext::new();
-
-    let bare = prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
-    wait_for_unit_start("hello.service", Duration::from_secs(15));
-
-    stop_sync_service();
-    push_commit(&bare, &[("a.txt", "1")], "one");
-    push_commit(&bare, &[("b.txt", "2")], "two");
-
-    let out = run_status(&["--json"]);
-    assert!(!out.status.success());
-    let v = parse_status_json(&out);
-    let state = &v["repos"][0]["state"];
-    assert_eq!(state["state"], "behind");
-    assert_eq!(state["commits"], 2);
-}
-
-// ---------------------------------------------------------------------------
-// Service state
-// ---------------------------------------------------------------------------
-
-#[test]
-#[ignore]
-fn status_service_reports_active_state_after_sync_and_reload() {
-    let _ctx = SyncTestContext::new();
-
-    prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
-    wait_for_unit_start("hello.service", Duration::from_secs(15));
-
-    let out = run_status(&["--no-fetch", "--json"]);
-    let v = parse_status_json(&out);
-    let svc = v["services"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["unit"] == "hello.service")
-        .expect("hello.service should appear in services")
-        .clone();
-
-    assert_eq!(svc["active_state"], "active", "svc: {svc}");
-    assert_eq!(svc["result"], "success");
-    assert_eq!(svc["needs_daemon_reload"], false);
-}
 
 #[test]
 #[ignore]
@@ -471,45 +442,6 @@ fn status_detects_restart_pending_after_reload_without_restart() {
         !out.status.success(),
         "expected exit 1 when restart pending"
     );
-}
-
-#[test]
-#[ignore]
-fn status_plain_output_has_expected_columns() {
-    let _ctx = SyncTestContext::new();
-
-    prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
-    wait_for_unit_start("hello.service", Duration::from_secs(15));
-
-    let out = run_status(&["--no-fetch"]);
-    let stdout = stdout_str(&out);
-    for needle in [
-        "Repositories",
-        "NAME",
-        "BRANCH",
-        "STATE",
-        "HEAD",
-        "Services",
-        "UNIT",
-        "ACTIVE",
-        "RELOAD",
-        "RESTART",
-        "UPTIME",
-        "NOTE",
-        "myapp",
-        "hello.service",
-    ] {
-        assert!(
-            stdout.contains(needle),
-            "expected column/value '{needle}' in plain output, got:\n{stdout}"
-        );
-    }
 }
 
 #[test]
