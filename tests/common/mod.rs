@@ -71,6 +71,14 @@ impl Vcs for NoopVcs {
     fn default_branch(&self, _repo_dir: &Path) -> String {
         "main".to_string()
     }
+    fn rev_list_left_right(
+        &self,
+        _repo_dir: &Path,
+        _local: &str,
+        _remote: &str,
+    ) -> Result<(usize, usize), String> {
+        Ok((0, 0))
+    }
 }
 
 #[allow(dead_code)]
@@ -95,6 +103,10 @@ impl SystemdTrait for NoopSystemd {
             active_state: "active".into(),
             sub_state: "running".into(),
             result: "success".into(),
+            need_daemon_reload: false,
+            n_restarts: 0,
+            active_enter_timestamp_monotonic: None,
+            fragment_path: None,
         }
     }
 }

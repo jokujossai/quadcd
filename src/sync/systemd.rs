@@ -14,6 +14,18 @@ pub struct UnitState {
     pub active_state: String,
     pub sub_state: String,
     pub result: String,
+    /// `systemctl show NeedDaemonReload=yes` — unit file on disk has changed
+    /// since systemd last loaded it.
+    pub need_daemon_reload: bool,
+    /// `NRestarts` — total restart count for the current invocation.
+    pub n_restarts: u32,
+    /// `ActiveEnterTimestampMonotonic` (microseconds since boot). `None` when
+    /// the unit has never become active or systemctl returned no value.
+    /// Monotonic is used because it is emitted by `systemctl show` as a plain
+    /// integer (the wall-clock variant is a localised date string).
+    pub active_enter_timestamp_monotonic: Option<u64>,
+    /// `FragmentPath` — path to the unit file currently loaded by systemd.
+    pub fragment_path: Option<String>,
 }
 
 impl UnitState {
@@ -22,6 +34,10 @@ impl UnitState {
             active_state: "unknown".to_string(),
             sub_state: "unknown".to_string(),
             result: "unknown".to_string(),
+            need_daemon_reload: false,
+            n_restarts: 0,
+            active_enter_timestamp_monotonic: None,
+            fragment_path: None,
         }
     }
 
@@ -279,6 +295,10 @@ impl SystemdTrait for Systemd {
             "--property=ActiveState",
             "--property=SubState",
             "--property=Result",
+            "--property=NeedDaemonReload",
+            "--property=NRestarts",
+            "--property=ActiveEnterTimestampMonotonic",
+            "--property=FragmentPath",
         ]);
 
         let Ok(capture) = self.exec().args(args.iter().copied()).capture() else {
@@ -296,6 +316,20 @@ impl SystemdTrait for Systemd {
                     "ActiveState" => state.active_state = val.to_string(),
                     "SubState" => state.sub_state = val.to_string(),
                     "Result" => state.result = val.to_string(),
+                    "NeedDaemonReload" => state.need_daemon_reload = val == "yes",
+                    "NRestarts" => state.n_restarts = val.parse().unwrap_or(0),
+                    "ActiveEnterTimestampMonotonic" => {
+                        state.active_enter_timestamp_monotonic =
+                            val.parse::<u64>().ok().filter(|v| *v > 0);
+                    }
+
+                    "FragmentPath" => {
+                        state.fragment_path = if val.is_empty() {
+                            None
+                        } else {
+                            Some(val.to_string())
+                        };
+                    }
                     _ => {}
                 }
             }
@@ -390,6 +424,10 @@ pub mod testing {
                     active_state: "active".to_string(),
                     sub_state: "running".to_string(),
                     result: "success".to_string(),
+                    need_daemon_reload: false,
+                    n_restarts: 0,
+                    active_enter_timestamp_monotonic: None,
+                    fragment_path: None,
                 })
         }
     }

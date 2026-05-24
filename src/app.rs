@@ -3,8 +3,10 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use crate::cli::{
-    parse_cli, GenerateInvocation, ParsedCommand, SyncInvocation, SYNC_USAGE, TOP_LEVEL_USAGE,
+    parse_cli, GenerateInvocation, ParsedCommand, StatusInvocation, SyncInvocation, STATUS_USAGE,
+    SYNC_USAGE, TOP_LEVEL_USAGE,
 };
+use crate::status::{self, StatusOptions};
 use crate::{dryrun, install, sync};
 
 use super::{install_signal_handlers, Generator, GeneratorImpl, SHUTDOWN, VERSION};
@@ -62,6 +64,7 @@ impl<'a> App<'a> {
             }
             Ok(ParsedCommand::Generate(invocation)) => self.run_generate(invocation),
             Ok(ParsedCommand::Sync(invocation)) => self.run_sync(invocation),
+            Ok(ParsedCommand::Status(invocation)) => self.run_status(invocation),
             Err(err) => {
                 err.emit(&self.cfg.output);
                 1
@@ -408,5 +411,77 @@ impl<'a> App<'a> {
                 0
             }
         }
+    }
+
+    /// Run the status subcommand.
+    fn run_status(&mut self, invocation: StatusInvocation) -> i32 {
+        if invocation.show_help {
+            let _ = writeln!(self.cfg.output.err(), "{STATUS_USAGE}");
+            return 0;
+        }
+
+        self.cfg
+            .apply_flags(invocation.force_user, invocation.verbose, false);
+
+        let default_vcs;
+        let vcs: &dyn sync::Vcs = match self.vcs {
+            Some(v) => v,
+            None => {
+                default_vcs = sync::GitVcs::with_command(
+                    self.cfg.git_command.as_deref(),
+                    self.cfg.git_timeout,
+                )
+                .known_hosts(self.cfg.data_dir.join(".known_hosts"))
+                .accept_new_host_keys(false)
+                .interactive(false);
+                &default_vcs
+            }
+        };
+        if let Err(e) = vcs.check() {
+            let _ = writeln!(self.cfg.output.err(), "Error: {e}");
+            return 1;
+        }
+
+        let cd_config = match self.cfg.cd_config {
+            Some(ref c) => c.clone(),
+            None => {
+                if let Some(ref path) = self.cfg.config_path {
+                    let _ = writeln!(
+                        self.cfg.output.err(),
+                        "Error: config file '{}' could not be loaded (see warning above)",
+                        path.display()
+                    );
+                } else {
+                    let _ = writeln!(self.cfg.output.err(), "Error: no config file found");
+                    if self.cfg.is_user_mode {
+                        let _ = writeln!(
+                            self.cfg.output.err(),
+                            "Create ~/.config/quadcd.toml or set QUADCD_CONFIG"
+                        );
+                    } else {
+                        let _ = writeln!(
+                            self.cfg.output.err(),
+                            "Create /etc/quadcd.toml or set QUADCD_CONFIG"
+                        );
+                    }
+                }
+                return 1;
+            }
+        };
+
+        let default_systemd;
+        let systemd: &dyn sync::SystemdTrait = match self.systemd {
+            Some(s) => s,
+            None => {
+                default_systemd = sync::Systemd::new();
+                &default_systemd
+            }
+        };
+
+        let opts = StatusOptions {
+            no_fetch: invocation.no_fetch,
+            json: invocation.json,
+        };
+        status::run_status(&self.cfg, &cd_config, vcs, systemd, &opts)
     }
 }
