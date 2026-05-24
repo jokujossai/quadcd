@@ -12,3 +12,6 @@ publish = false
 [dependencies]
 cargo-nextest = "=0.9.136"
 cargo-llvm-cov = "=0.8.7"
+
+[package.metadata.cargo-machete]
+ignored = ["cargo-nextest", "cargo-llvm-cov"]
