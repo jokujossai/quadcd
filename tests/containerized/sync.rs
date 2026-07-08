@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
 use std::time::Duration;
 
 use crate::helpers::*;
@@ -426,6 +427,106 @@ fn service_sync_reports_failed_service() {
     assert!(
         journal_contains("30s ago", "service(s) failed after restart: crash.service"),
         "expected aggregated failure summary in sync journal"
+    );
+
+    assert!(is_service_active(), "sync service should still be running");
+}
+
+/// A volume unit without `[Install]` that is stopped should NOT be started
+/// when its file is updated during sync.  Only explicitly enabled units
+/// should be auto-started; generated/static units are dependency-activated.
+#[test]
+#[ignore]
+fn service_sync_does_not_start_stopped_generated_unit() {
+    let _ctx = SyncTestContext::new();
+
+    // A volume without [Install] — systemd reports it as "generated".
+    let bare = create_bare_repo(
+        "myapp",
+        &[
+            (
+                "data.volume",
+                "[Volume]\nLabel=quadcd-test-data\n",
+            ),
+            (
+                "hello.container",
+                "[Container]\n\
+                 Image=docker.io/library/alpine:latest\n\
+                 Exec=/bin/true\n\
+                 Volume=data.volume:/data\n\n\
+                 [Install]\nWantedBy=default.target\n",
+            ),
+        ],
+    );
+
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.myapp]\nurl = \"{}\"\ninterval = \"2s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    start_sync_service();
+
+    wait_for_file("myapp", "data.volume", Duration::from_secs(10));
+    wait_for_file("myapp", "hello.container", Duration::from_secs(10));
+
+    // Wait for the container (and thus the volume) to have been started.
+    wait_for_unit_start("hello.service", Duration::from_secs(30));
+    wait_for_unit_start("data-volume.service", Duration::from_secs(10));
+
+    // Stop the volume unit manually.
+    assert!(
+        systemctl(&["stop", "data-volume.service"]),
+        "failed to stop data-volume.service"
+    );
+    // Also stop the container so the volume isn't pulled back in.
+    assert!(
+        systemctl(&["stop", "hello.service"]),
+        "failed to stop hello.service"
+    );
+
+    // Confirm it is stopped.
+    assert!(
+        !systemctl(&["is-active", "--quiet", "data-volume.service"]),
+        "data-volume.service should be inactive after stop"
+    );
+
+    // Push an update to the volume file — the content changes but there
+    // is still no [Install] section.
+    push_commit(
+        &bare,
+        &[(
+            "data.volume",
+            "[Volume]\nLabel=quadcd-test-data-v2\n",
+        )],
+        "update volume label",
+    );
+
+    // Wait for the sync to pick up the new commit.
+    wait_until(
+        Duration::from_secs(15),
+        "sync to pick up volume update",
+        || {
+            let content = fs::read_to_string(
+                PathBuf::from(data_dir()).join("myapp/data.volume"),
+            );
+            content
+                .as_ref()
+                .map(|c| c.contains("quadcd-test-data-v2"))
+                .unwrap_or(false)
+        },
+    );
+
+    // Give sync a moment to (incorrectly) start the unit if the bug is present.
+    thread::sleep(Duration::from_secs(3));
+
+    // The volume unit should still be stopped — sync must NOT start it.
+    assert!(
+        !systemctl(&["is-active", "--quiet", "data-volume.service"]),
+        "data-volume.service should NOT have been started by sync (no [Install] and was stopped)"
     );
 
     assert!(is_service_active(), "sync service should still be running");

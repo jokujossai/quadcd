@@ -61,8 +61,8 @@ pub(crate) fn is_template_unit(unit_name: &str) -> bool {
 /// After `daemon-reload`, each changed unit is inspected:
 /// - **Templates** (`foo@.service`): discover running instances via
 ///   `list-units` and restart them.
-/// - **Enabled / generated** units: `start` if not active, `restart` if active.
-/// - **Static** units: `restart` only if currently active.
+/// - **Enabled** units: `start` if not active, `restart` if active.
+/// - **Static / generated** units: `restart` only if currently active.
 /// - **Disabled / masked** units: skipped.
 ///
 /// Returns the list of units whose post-activation `ActiveState` is anything
@@ -112,23 +112,34 @@ pub(crate) fn activate_changed_units_inner(
         let enabled = systemd.is_enabled(unit, cfg);
         let active = systemd.is_active(unit, cfg);
 
-        // Treat any "enabled*" variant (enabled, enabled-runtime) plus
-        // static and generated as startable units.
-        let startable =
-            enabled.starts_with("enabled") || enabled == "static" || enabled == "generated";
+        // "enabled*" units are explicitly activated and should be started
+        // even when currently inactive.  "static" and "generated" units
+        // have no [Install] section — they are pulled in by dependency so
+        // we only restart them when already running.
+        let explicitly_enabled = enabled.starts_with("enabled");
+        let dep_activated = enabled == "static" || enabled == "generated";
 
-        match (startable, active) {
-            (true, true) => to_restart.push(unit.clone()),
-            (true, false) => to_start.push(unit.clone()),
-            (false, true) => to_restart.push(unit.clone()),
-            _ => {
-                if cfg.verbose {
-                    let _ = writeln!(
-                        cfg.output.err(),
-                        "[quadcd] Skipping {unit} (is-enabled={enabled}, active={active})"
-                    );
-                }
+        if active {
+            // Always restart a running unit whose file changed,
+            // regardless of enable state.
+            to_restart.push(unit.clone());
+        } else if explicitly_enabled {
+            // Explicitly enabled but not running — start it.
+            to_start.push(unit.clone());
+        } else if dep_activated {
+            // Static/generated and stopped — it will be pulled in by
+            // its dependant; don't start it directly.
+            if cfg.verbose {
+                let _ = writeln!(
+                    cfg.output.err(),
+                    "[quadcd] Skipping {unit} (is-enabled={enabled}, active={active})"
+                );
             }
+        } else if cfg.verbose {
+            let _ = writeln!(
+                cfg.output.err(),
+                "[quadcd] Skipping {unit} (is-enabled={enabled}, active={active})"
+            );
         }
     }
 
@@ -420,10 +431,11 @@ mod tests {
     #[rstest]
     #[case::enabled_inactive_starts("enabled", false, "start")]
     #[case::enabled_active_restarts("enabled", true, "restart")]
-    #[case::generated_starts("generated", false, "start")]
+    #[case::generated_active_restarts("generated", true, "restart")]
+    #[case::generated_inactive_skips("generated", false, "skip")]
     #[case::enabled_runtime_starts("enabled-runtime", false, "start")]
     #[case::static_active_restarts("static", true, "restart")]
-    #[case::static_inactive_starts("static", false, "start")]
+    #[case::static_inactive_skips("static", false, "skip")]
     #[case::disabled_skipped("disabled", false, "skip")]
     #[case::masked_skipped("masked", false, "skip")]
     fn activate_unit_by_state(
