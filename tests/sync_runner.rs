@@ -23,10 +23,14 @@ fn run_once_syncs_and_restarts() {
 
     let vcs = MockVcs::new();
     let systemd = MockSystemd::new();
+    systemd.reverse_deps_map.borrow_mut().insert(
+        "app.service".to_string(),
+        vec!["default.target".to_string()],
+    );
     systemd
-        .enabled_map
+        .active_set
         .borrow_mut()
-        .insert("app.service".to_string(), "enabled".to_string());
+        .insert("default.target".to_string());
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");
@@ -189,10 +193,14 @@ fn run_once_sync_only_skips_reload_and_restart() {
 
     let vcs = MockVcs::new();
     let systemd = MockSystemd::new();
+    systemd.reverse_deps_map.borrow_mut().insert(
+        "app.service".to_string(),
+        vec!["default.target".to_string()],
+    );
     systemd
-        .enabled_map
+        .active_set
         .borrow_mut()
-        .insert("app.service".to_string(), "enabled".to_string());
+        .insert("default.target".to_string());
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");
@@ -427,10 +435,14 @@ fn run_once_stops_deleted_units_before_reload() {
         .active_set
         .borrow_mut()
         .insert("gone.service".to_string());
+    systemd.reverse_deps_map.borrow_mut().insert(
+        "web.service".to_string(),
+        vec!["default.target".to_string()],
+    );
     systemd
-        .enabled_map
+        .active_set
         .borrow_mut()
-        .insert("web.service".to_string(), "enabled".to_string());
+        .insert("default.target".to_string());
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");

@@ -19,7 +19,7 @@ use std::process::Command;
 
 use rstest::*;
 
-use crate::helpers::is_user_mode;
+use crate::helpers::{is_user_mode, wanted_by};
 
 // ---------------------------------------------------------------------------
 // Mode-aware paths
@@ -55,14 +55,6 @@ fn generator_dirs() -> (String, String, String) {
 fn quadlet_dir() -> String {
     let (normal, _, _) = generator_dirs();
     format!("{normal}/quadcd")
-}
-
-fn wanted_by() -> &'static str {
-    if is_user_mode() {
-        "default.target"
-    } else {
-        "multi-user.target"
-    }
 }
 
 fn systemctl(args: &[&str]) -> bool {
@@ -396,6 +388,69 @@ fn daemon_reload_cleans_quadlet_files(mut ctx: TestContext) {
     assert!(
         !installed.exists(),
         "hello.container should be cleaned after generate with empty sources"
+    );
+}
+
+/// Boot-behavior check: after `daemon-reload` regenerates units, re-activating
+/// the boot target must start a plain unit whose `[Install]` section quadcd
+/// materialised as a `.wants` symlink — and must NOT start a unit without one.
+#[rstest]
+#[ignore]
+fn target_start_activates_only_units_with_install(mut ctx: TestContext) {
+    ctx.install_source(
+        "withinstall.service",
+        &format!(
+            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n\n[Install]\nWantedBy={}\n",
+            wanted_by()
+        ),
+    );
+    ctx.install_source(
+        "noinstall.service",
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
+    );
+    ctx.generated_services.extend([
+        "withinstall.service".to_string(),
+        "noinstall.service".to_string(),
+    ]);
+
+    // daemon-reload re-runs the quadcd generator over the sources.
+    assert!(systemctl(&["daemon-reload"]), "daemon-reload failed");
+
+    // The [Install] section must be materialised as a .wants symlink.
+    let (normal, _, _) = generator_dirs();
+    let link = PathBuf::from(&normal).join(format!("{}.wants/withinstall.service", wanted_by()));
+    assert!(
+        link.symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false),
+        "expected wants symlink at {}",
+        link.display()
+    );
+    assert!(
+        !PathBuf::from(&normal)
+            .join(format!("{}.wants/noinstall.service", wanted_by()))
+            .exists(),
+        "noinstall.service must not be linked into {}.wants",
+        wanted_by()
+    );
+
+    // Starting the (already active) boot target replays what boot does:
+    // its Wants= dependencies are pulled into the transaction.
+    assert!(systemctl(&["start", wanted_by()]), "starting target failed");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !systemctl(&["is-active", "--quiet", "withinstall.service"]) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "withinstall.service should become active after starting {}",
+            wanted_by()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        !systemctl(&["is-active", "--quiet", "noinstall.service"]),
+        "noinstall.service must stay inactive after starting {}",
+        wanted_by()
     );
 }
 

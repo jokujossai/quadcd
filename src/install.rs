@@ -244,6 +244,11 @@ pub fn install_quadlet_files(
 
 /// Install plain systemd unit files from `source_dir` directly into
 /// `normal_dir`, applying environment variable substitution.
+///
+/// Like Quadlet, the `[Install]` section is honoured by materialising
+/// `WantedBy=`/`RequiredBy=` as `<target>.wants/` and `<target>.requires/`
+/// symlinks in `normal_dir` — generated units cannot be enabled with
+/// `systemctl enable`, so this is the only way for them to start at boot.
 pub fn install_systemd_units(
     source_dir: &Path,
     normal_dir: &Path,
@@ -265,8 +270,87 @@ pub fn install_systemd_units(
         let content = set_source_path(&content, file);
         write_atomic(&normal_dir.join(name.as_ref()), &content)
             .map_err(|e| format!("Failed to write {name}: {e}"))?;
+        link_install_dependencies(&name, &content, normal_dir, cfg);
     }
     Ok(())
+}
+
+/// Dependency lists parsed from a unit's `[Install]` section.
+#[derive(Debug, Default, PartialEq)]
+struct InstallSection {
+    wanted_by: Vec<String>,
+    required_by: Vec<String>,
+}
+
+/// Parse `WantedBy=` and `RequiredBy=` from the `[Install]` section.
+///
+/// Values are space-separated and accumulate across repeated assignments;
+/// an empty assignment resets the list (systemd semantics).
+fn parse_install_section(content: &str) -> InstallSection {
+    let mut section = InstallSection::default();
+    let mut in_install = false;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_install = line == "[Install]";
+            continue;
+        }
+        if !in_install {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let list = match key.trim() {
+            "WantedBy" => &mut section.wanted_by,
+            "RequiredBy" => &mut section.required_by,
+            _ => continue,
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            list.clear();
+        } else {
+            list.extend(value.split_whitespace().map(str::to_string));
+        }
+    }
+    section
+}
+
+/// Create `<target>.wants/<unit>` and `<target>.requires/<unit>` symlinks in
+/// `normal_dir` for the unit's `[Install]` dependencies.
+fn link_install_dependencies(unit_name: &str, content: &str, normal_dir: &Path, cfg: &Config) {
+    let install = parse_install_section(content);
+    let deps = install
+        .wanted_by
+        .iter()
+        .map(|t| (t, "wants"))
+        .chain(install.required_by.iter().map(|t| (t, "requires")));
+    for (target, kind) in deps {
+        let dir = normal_dir.join(format!("{target}.{kind}"));
+        let link = dir.join(unit_name);
+        let result = fs::create_dir_all(&dir)
+            .and_then(|()| std::os::unix::fs::symlink(Path::new("..").join(unit_name), &link));
+        match result {
+            Ok(()) => {
+                if cfg.verbose {
+                    let _ = writeln!(
+                        cfg.output.err(),
+                        "[quadcd] Linking {unit_name} into {target}.{kind}/"
+                    );
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                let _ = writeln!(
+                    cfg.output.err(),
+                    "[quadcd] Warning: failed to link {unit_name} into {target}.{kind}/: {e}"
+                );
+            }
+        }
+    }
 }
 
 /// Create symbolic links in `quadlet_dir` for every `*.d` drop-in directory
@@ -916,6 +1000,106 @@ mod tests {
             installed.contains("SourcePath=") && installed.contains("beta/dup.container"),
             "content: {installed}"
         );
+    }
+
+    // parse_install_section
+
+    #[test]
+    fn parse_install_section_wanted_and_required() {
+        let unit = "[Unit]\nDescription=x\n\n[Install]\nWantedBy=multi-user.target default.target\nRequiredBy=other.service\n";
+        let section = parse_install_section(unit);
+        assert_eq!(
+            section.wanted_by,
+            vec!["multi-user.target", "default.target"]
+        );
+        assert_eq!(section.required_by, vec!["other.service"]);
+    }
+
+    #[test]
+    fn parse_install_section_accumulates_and_resets() {
+        let unit =
+            "[Install]\nWantedBy=a.target\nWantedBy=b.target\nRequiredBy=c.target\nRequiredBy=\n";
+        let section = parse_install_section(unit);
+        assert_eq!(section.wanted_by, vec!["a.target", "b.target"]);
+        assert!(section.required_by.is_empty());
+    }
+
+    #[test]
+    fn parse_install_section_ignores_other_sections_and_comments() {
+        let unit = "[Service]\nWantedBy=not-install.target\n[Install]\n# comment\n; comment\nAlias=foo.service\nWantedBy=real.target\n[Unit]\nWantedBy=also-not.target\n";
+        let section = parse_install_section(unit);
+        assert_eq!(section.wanted_by, vec!["real.target"]);
+        assert!(section.required_by.is_empty());
+    }
+
+    #[test]
+    fn parse_install_section_missing_is_empty() {
+        assert_eq!(
+            parse_install_section("[Service]\nExecStart=/bin/true\n"),
+            InstallSection::default()
+        );
+    }
+
+    // install_systemd_units [Install] symlinks
+
+    #[test]
+    fn install_systemd_units_links_install_dependencies() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let normal = tmp.path().join("normal");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("app.service"),
+            "[Service]\nExecStart=/bin/true\n\n[Install]\nWantedBy=multi-user.target\nRequiredBy=critical.target\n",
+        )
+        .unwrap();
+        fs::write(
+            source.join("plain.service"),
+            "[Service]\nExecStart=/bin/true\n",
+        )
+        .unwrap();
+
+        let cfg = crate::config::test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+        install_systemd_units(&source, &normal, &HashMap::new(), &cfg).unwrap();
+
+        let wants = normal.join("multi-user.target.wants/app.service");
+        let requires = normal.join("critical.target.requires/app.service");
+        assert!(wants.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(requires
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // Relative link resolving to the installed unit next to the .wants dir.
+        assert_eq!(
+            fs::read_link(&wants).unwrap(),
+            PathBuf::from("../app.service")
+        );
+        assert!(fs::read_to_string(&wants).unwrap().contains("ExecStart"));
+        // Units without [Install] get no links.
+        assert!(!normal
+            .join("multi-user.target.wants/plain.service")
+            .exists());
+    }
+
+    #[test]
+    fn install_systemd_units_link_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let normal = tmp.path().join("normal");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("app.service"),
+            "[Service]\nExecStart=/bin/true\n\n[Install]\nWantedBy=multi-user.target\n",
+        )
+        .unwrap();
+
+        let cfg = crate::config::test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+        install_systemd_units(&source, &normal, &HashMap::new(), &cfg).unwrap();
+        install_systemd_units(&source, &normal, &HashMap::new(), &cfg).unwrap();
+
+        let link = normal.join("multi-user.target.wants/app.service");
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
     }
 
     // symlink_dropins

@@ -17,5 +17,5 @@ podman run \
   -t \
   --privileged \
   --systemd=always \
-  --timeout 120 \
+  --timeout 180 \
   "$IMAGE_NAME"

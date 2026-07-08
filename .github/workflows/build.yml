@@ -194,7 +194,7 @@ jobs:
       - name: Run containerized systemd integration tests
         run: |
           set -o pipefail
-          podman run --rm -t --privileged --systemd=always --timeout 120 quadcd-test 2>&1 | tee integration-output.txt
+          podman run --rm -t --privileged --systemd=always --timeout 180 quadcd-test 2>&1 | tee integration-output.txt
           echo '### Integration Tests' >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           grep -o 'test result: .*' integration-output.txt >> "$GITHUB_STEP_SUMMARY"

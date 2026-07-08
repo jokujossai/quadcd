@@ -62,6 +62,10 @@ pub trait SystemdTrait {
     fn is_enabled(&self, unit: &str, cfg: &Config) -> String;
     /// Return `true` if the unit is currently active (running).
     fn is_active(&self, unit: &str, cfg: &Config) -> bool;
+    /// Return the units that want or require this unit (`WantedBy=` plus
+    /// `RequiredBy=` from `systemctl show`), including targets linked via
+    /// generator `.wants`/`.requires` symlinks. Empty on error.
+    fn reverse_deps(&self, unit: &str, cfg: &Config) -> Vec<String>;
     /// List loaded unit names matching a glob pattern (e.g. "foo@*.service").
     fn list_units_matching(&self, pattern: &str, cfg: &Config) -> Vec<String>;
     /// Return the unit's `ActiveState`, `SubState`, and `Result` via
@@ -273,6 +277,25 @@ impl SystemdTrait for Systemd {
             .is_ok_and(|c| c.success())
     }
 
+    fn reverse_deps(&self, unit: &str, cfg: &Config) -> Vec<String> {
+        let mut args = Self::user_args(cfg);
+        args.extend([
+            "show",
+            unit,
+            "--property=WantedBy",
+            "--property=RequiredBy",
+            "--value",
+        ]);
+
+        match self.exec().args(args.iter().copied()).capture() {
+            Ok(capture) if capture.success() => String::from_utf8_lossy(&capture.stdout)
+                .split_whitespace()
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     fn list_units_matching(&self, pattern: &str, cfg: &Config) -> Vec<String> {
         let mut args = Self::user_args(cfg);
         args.extend(["list-units", pattern, "--no-legend", "--plain", "--all"]);
@@ -355,6 +378,7 @@ pub mod testing {
         pub call_log: RefCell<Vec<String>>,
         pub enabled_map: RefCell<HashMap<String, String>>,
         pub active_set: RefCell<HashSet<String>>,
+        pub reverse_deps_map: RefCell<HashMap<String, Vec<String>>>,
         pub listed_units: RefCell<HashMap<String, Vec<String>>>,
         pub state_map: RefCell<HashMap<String, UnitState>>,
     }
@@ -369,6 +393,7 @@ pub mod testing {
                 call_log: RefCell::new(Vec::new()),
                 enabled_map: RefCell::new(HashMap::new()),
                 active_set: RefCell::new(HashSet::new()),
+                reverse_deps_map: RefCell::new(HashMap::new()),
                 listed_units: RefCell::new(HashMap::new()),
                 state_map: RefCell::new(HashMap::new()),
             }
@@ -407,6 +432,13 @@ pub mod testing {
         }
         fn is_active(&self, unit: &str, _cfg: &Config) -> bool {
             self.active_set.borrow().contains(unit)
+        }
+        fn reverse_deps(&self, unit: &str, _cfg: &Config) -> Vec<String> {
+            self.reverse_deps_map
+                .borrow()
+                .get(unit)
+                .cloned()
+                .unwrap_or_default()
         }
         fn list_units_matching(&self, pattern: &str, _cfg: &Config) -> Vec<String> {
             self.listed_units

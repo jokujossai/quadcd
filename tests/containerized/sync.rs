@@ -16,13 +16,7 @@ use crate::helpers::*;
 fn service_initial_sync_clones_repo() {
     let _ctx = SyncTestContext::new();
 
-    let bare = create_bare_repo(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = create_bare_repo("myapp", &[("hello.service", oneshot_unit().as_str())]);
 
     fs::write(
         config_path(),
@@ -55,20 +49,8 @@ fn service_initial_sync_clones_repo() {
 fn service_config_reload_adds_repo() {
     let _ctx = SyncTestContext::new();
 
-    let bare_a = create_bare_repo(
-        "repo-a",
-        &[(
-            "a.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
-    let bare_b = create_bare_repo(
-        "repo-b",
-        &[(
-            "b.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare_a = create_bare_repo("repo-a", &[("a.service", oneshot_unit().as_str())]);
+    let bare_b = create_bare_repo("repo-b", &[("b.service", oneshot_unit().as_str())]);
 
     // Start with only repo-a
     fs::write(
@@ -114,20 +96,8 @@ fn service_config_reload_adds_repo() {
 fn service_config_reload_removes_repo() {
     let _ctx = SyncTestContext::new();
 
-    let bare_a = create_bare_repo(
-        "repo-a",
-        &[(
-            "a.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
-    let bare_b = create_bare_repo(
-        "repo-b",
-        &[(
-            "b.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare_a = create_bare_repo("repo-a", &[("a.service", oneshot_unit().as_str())]);
+    let bare_b = create_bare_repo("repo-b", &[("b.service", oneshot_unit().as_str())]);
 
     // Start with both repos using short intervals
     fs::write(
@@ -183,13 +153,7 @@ fn service_config_reload_removes_repo() {
 fn service_interval_pulls_updates() {
     let _ctx = SyncTestContext::new();
 
-    let bare = create_bare_repo(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = create_bare_repo("myapp", &[("hello.service", oneshot_unit().as_str())]);
 
     fs::write(
         config_path(),
@@ -228,13 +192,7 @@ fn service_interval_pulls_updates() {
 fn service_graceful_shutdown() {
     let _ctx = SyncTestContext::new();
 
-    let bare = create_bare_repo(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = create_bare_repo("myapp", &[("hello.service", oneshot_unit().as_str())]);
 
     fs::write(
         config_path(),
@@ -275,13 +233,7 @@ fn service_graceful_shutdown() {
 fn service_allows_concurrent_manual_sync() {
     let _ctx = SyncTestContext::new();
 
-    let bare = create_bare_repo(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = create_bare_repo("myapp", &[("hello.service", oneshot_unit().as_str())]);
 
     fs::write(
         config_path(),
@@ -317,10 +269,7 @@ fn service_syncs_configured_branch() {
     let bare = create_bare_repo_on_branch(
         "myapp",
         "develop",
-        &[(
-            "dev.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
+        &[("dev.service", oneshot_unit().as_str())],
     );
 
     fs::write(
@@ -357,9 +306,14 @@ fn service_sync_reports_failed_quadlet_container() {
         "broken",
         &[(
             "broken.container",
-            "[Container]\n\
-             Image=localhost/quadcd-does-not-exist:nope\n\n\
-             [Service]\nRestart=no\n",
+            format!(
+                "[Container]\n\
+                 Image=localhost/quadcd-does-not-exist:nope\n\n\
+                 [Service]\nRestart=no\n\n\
+                 [Install]\nWantedBy={}\n",
+                wanted_by()
+            )
+            .as_str(),
         )],
     );
 
@@ -400,7 +354,11 @@ fn service_sync_reports_failed_service() {
         "myapp",
         &[(
             "crash.service",
-            "[Service]\nType=simple\nExecStart=/bin/false\n",
+            format!(
+                "[Service]\nType=simple\nExecStart=/bin/false\n\n[Install]\nWantedBy={}\n",
+                wanted_by()
+            )
+            .as_str(),
         )],
     );
 
@@ -444,10 +402,7 @@ fn service_sync_does_not_start_stopped_generated_unit() {
     let bare = create_bare_repo(
         "myapp",
         &[
-            (
-                "data.volume",
-                "[Volume]\nLabel=quadcd-test-data\n",
-            ),
+            ("data.volume", "[Volume]\nLabel=quadcd-test-data\n"),
             (
                 "hello.container",
                 "[Container]\n\
@@ -498,10 +453,7 @@ fn service_sync_does_not_start_stopped_generated_unit() {
     // is still no [Install] section.
     push_commit(
         &bare,
-        &[(
-            "data.volume",
-            "[Volume]\nLabel=quadcd-test-data-v2\n",
-        )],
+        &[("data.volume", "[Volume]\nLabel=quadcd-test-data-v2\n")],
         "update volume label",
     );
 
@@ -510,9 +462,7 @@ fn service_sync_does_not_start_stopped_generated_unit() {
         Duration::from_secs(15),
         "sync to pick up volume update",
         || {
-            let content = fs::read_to_string(
-                PathBuf::from(data_dir()).join("myapp/data.volume"),
-            );
+            let content = fs::read_to_string(PathBuf::from(data_dir()).join("myapp/data.volume"));
             content
                 .as_ref()
                 .map(|c| c.contains("quadcd-test-data-v2"))
