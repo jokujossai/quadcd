@@ -178,13 +178,7 @@ fn status_missing_repo_reports_missing_and_exits_one() {
 fn status_clean_state_after_sync() {
     let _ctx = SyncTestContext::new();
 
-    prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    prime_repo_via_service("myapp", &[("hello.service", oneshot_unit().as_str())]);
     wait_for_unit_start("hello.service", Duration::from_secs(15));
 
     // (1) + (2): plain-text output and exit code.
@@ -260,13 +254,7 @@ fn status_clean_state_after_sync() {
 fn status_behind_after_upstream_commits() {
     let _ctx = SyncTestContext::new();
 
-    let bare = prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = prime_repo_via_service("myapp", &[("hello.service", oneshot_unit().as_str())]);
     wait_for_unit_start("hello.service", Duration::from_secs(15));
 
     // Stop the sync service so it can't pull the new upstream commits before
@@ -298,13 +286,7 @@ fn status_behind_after_upstream_commits() {
 fn status_no_fetch_does_not_detect_upstream_change() {
     let _ctx = SyncTestContext::new();
 
-    let bare = prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = prime_repo_via_service("myapp", &[("hello.service", oneshot_unit().as_str())]);
     wait_for_unit_start("hello.service", Duration::from_secs(15));
 
     stop_sync_service();
@@ -328,13 +310,7 @@ fn status_no_fetch_does_not_detect_upstream_change() {
 fn status_url_mismatch_detected_and_does_not_fetch() {
     let _ctx = SyncTestContext::new();
 
-    prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    prime_repo_via_service("myapp", &[("hello.service", oneshot_unit().as_str())]);
     wait_for_unit_start("hello.service", Duration::from_secs(15));
 
     // Stop the sync service before rewriting the config, otherwise it will
@@ -363,13 +339,7 @@ fn status_url_mismatch_detected_and_does_not_fetch() {
 fn status_detects_daemon_reload_pending_when_unit_file_modified() {
     let _ctx = SyncTestContext::new();
 
-    prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    prime_repo_via_service("myapp", &[("hello.service", oneshot_unit().as_str())]);
     wait_for_unit_start("hello.service", Duration::from_secs(15));
 
     // Stop the sync service so it doesn't notice the change and run its own
@@ -404,13 +374,7 @@ fn status_detects_daemon_reload_pending_when_unit_file_modified() {
 fn status_detects_restart_pending_after_reload_without_restart() {
     let _ctx = SyncTestContext::new();
 
-    prime_repo_via_service(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    prime_repo_via_service("myapp", &[("hello.service", oneshot_unit().as_str())]);
     wait_for_unit_start("hello.service", Duration::from_secs(15));
 
     // Stop the sync service so it doesn't restart the unit during our setup.
@@ -470,7 +434,11 @@ RemainAfterExit=yes
 ExecStart=/bin/sh -c 'f="{counter_path}"; n=$(cat "$f" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$f"; [ "$n" -ge 4 ]'
 Restart=on-failure
 RestartSec=100ms
-"#
+
+[Install]
+WantedBy={target}
+"#,
+        target = wanted_by()
     );
 
     prime_repo_via_service("flapper", &[("flap.service", unit.as_str())]);

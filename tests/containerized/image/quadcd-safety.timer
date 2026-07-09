@@ -2,7 +2,7 @@
 Description=Safety timeout for integration test
 
 [Timer]
-OnBootSec=60s
+OnBootSec=120s
 
 [Install]
 WantedBy=timers.target

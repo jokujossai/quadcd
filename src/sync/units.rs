@@ -61,9 +61,15 @@ pub(crate) fn is_template_unit(unit_name: &str) -> bool {
 /// After `daemon-reload`, each changed unit is inspected:
 /// - **Templates** (`foo@.service`): discover running instances via
 ///   `list-units` and restart them.
-/// - **Enabled / generated** units: `start` if not active, `restart` if active.
-/// - **Static** units: `restart` only if currently active.
-/// - **Disabled / masked** units: skipped.
+/// - **Active** units: `restart` — a running unit whose file changed keeps
+///   running with the new configuration.
+/// - **Inactive** units: `start` only if some unit that wants or requires
+///   them is active. This mirrors boot: quadcd-deployed units are all
+///   `generated`, so the only thing that starts them at boot is a
+///   `.wants`/`.requires` link from an active unit (typically
+///   `default.target`, materialised from `[Install]`). Anything else —
+///   including units an operator stopped by hand — is left alone, so sync
+///   never creates a running state that a reboot would not reproduce.
 ///
 /// Returns the list of units whose post-activation `ActiveState` is anything
 /// other than `active`/`activating` (i.e. failed to come up).
@@ -109,26 +115,25 @@ pub(crate) fn activate_changed_units_inner(
             continue;
         }
 
-        let enabled = systemd.is_enabled(unit, cfg);
-        let active = systemd.is_active(unit, cfg);
+        if systemd.is_active(unit, cfg) {
+            // Always restart a running unit whose file changed.
+            to_restart.push(unit.clone());
+            continue;
+        }
 
-        // Treat any "enabled*" variant (enabled, enabled-runtime) plus
-        // static and generated as startable units.
-        let startable =
-            enabled.starts_with("enabled") || enabled == "static" || enabled == "generated";
-
-        match (startable, active) {
-            (true, true) => to_restart.push(unit.clone()),
-            (true, false) => to_start.push(unit.clone()),
-            (false, true) => to_restart.push(unit.clone()),
-            _ => {
-                if cfg.verbose {
-                    let _ = writeln!(
-                        cfg.output.err(),
-                        "[quadcd] Skipping {unit} (is-enabled={enabled}, active={active})"
-                    );
-                }
-            }
+        // Inactive: start only if boot would — i.e. something that wants or
+        // requires this unit is itself active. `[Install]` links show up
+        // here as active targets (e.g. default.target); a unit nothing
+        // depends on, or one whose dependants are stopped, stays stopped.
+        let deps = systemd.reverse_deps(unit, cfg);
+        if deps.iter().any(|dep| systemd.is_active(dep, cfg)) {
+            to_start.push(unit.clone());
+        } else if cfg.verbose {
+            let _ = writeln!(
+                cfg.output.err(),
+                "[quadcd] Skipping inactive {unit} (not wanted by any active unit; wanted/required by: [{}])",
+                deps.join(", ")
+            );
         }
     }
 
@@ -384,10 +389,6 @@ mod tests {
     fn restart_deduplicates_units() {
         let systemd = MockSystemd::new();
         for unit in &["app.service", "app-volume.service", "web.service"] {
-            systemd
-                .enabled_map
-                .borrow_mut()
-                .insert(unit.to_string(), "enabled".to_string());
             systemd.active_set.borrow_mut().insert(unit.to_string());
         }
         let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
@@ -418,25 +419,26 @@ mod tests {
     }
 
     #[rstest]
-    #[case::enabled_inactive_starts("enabled", false, "start")]
-    #[case::enabled_active_restarts("enabled", true, "restart")]
-    #[case::generated_starts("generated", false, "start")]
-    #[case::enabled_runtime_starts("enabled-runtime", false, "start")]
-    #[case::static_active_restarts("static", true, "restart")]
-    #[case::static_inactive_starts("static", false, "start")]
-    #[case::disabled_skipped("disabled", false, "skip")]
-    #[case::masked_skipped("masked", false, "skip")]
+    #[case::inactive_wanted_by_active_target(&["default.target"], &["default.target"], false, "start")]
+    #[case::inactive_required_by_active_unit(&["consumer.service"], &["consumer.service"], false, "start")]
+    #[case::inactive_wanted_by_inactive_unit(&["consumer.service"], &[], false, "skip")]
+    #[case::inactive_one_of_many_deps_active(&["a.service", "b.target"], &["b.target"], false, "start")]
+    #[case::inactive_without_deps_skipped(&[], &[], false, "skip")]
+    #[case::active_without_deps_restarts(&[], &[], true, "restart")]
+    #[case::active_with_inactive_deps_restarts(&["consumer.service"], &[], true, "restart")]
     fn activate_unit_by_state(
-        #[case] enabled_state: &str,
+        #[case] reverse_deps: &[&str],
+        #[case] active_deps: &[&str],
         #[case] is_active: bool,
         #[case] expected: &str,
     ) {
         let systemd = MockSystemd::new();
-        if enabled_state != "disabled" {
-            systemd
-                .enabled_map
-                .borrow_mut()
-                .insert("app.service".to_string(), enabled_state.to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            reverse_deps.iter().map(|s| s.to_string()).collect(),
+        );
+        for dep in active_deps {
+            systemd.active_set.borrow_mut().insert(dep.to_string());
         }
         if is_active {
             systemd
@@ -472,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn activate_not_enabled_but_active_restarts() {
+    fn activate_active_unit_without_deps_restarts() {
         let systemd = MockSystemd::new();
         systemd
             .active_set
@@ -511,22 +513,18 @@ mod tests {
     #[test]
     fn activate_verbose_logs_actions() {
         let systemd = MockSystemd::new();
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "new.service".to_string(),
+            vec!["default.target".to_string()],
+        );
         systemd
-            .enabled_map
+            .active_set
             .borrow_mut()
-            .insert("new.service".to_string(), "enabled".to_string());
-        systemd
-            .enabled_map
-            .borrow_mut()
-            .insert("running.service".to_string(), "enabled".to_string());
+            .insert("default.target".to_string());
         systemd
             .active_set
             .borrow_mut()
             .insert("running.service".to_string());
-        systemd
-            .enabled_map
-            .borrow_mut()
-            .insert("skip.service".to_string(), "disabled".to_string());
 
         let err_buf = crate::output::tests::TestWriter::new();
         let mut cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
@@ -549,7 +547,7 @@ mod tests {
             "expected restarting log in: {stderr}"
         );
         assert!(
-            stderr.contains("Skipping skip.service"),
+            stderr.contains("Skipping inactive skip.service"),
             "expected skip log in: {stderr}"
         );
     }
@@ -557,10 +555,14 @@ mod tests {
     #[test]
     fn activate_reports_active_state_per_unit() {
         let systemd = MockSystemd::new();
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["default.target".to_string()],
+        );
         systemd
-            .enabled_map
+            .active_set
             .borrow_mut()
-            .insert("app.service".to_string(), "enabled".to_string());
+            .insert("default.target".to_string());
         let err_buf = crate::output::tests::TestWriter::new();
         let cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
 
@@ -602,10 +604,14 @@ mod tests {
     fn activate_reports_failed_state_and_returns_failures() {
         use super::super::systemd::UnitState;
         let systemd = MockSystemd::new();
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["default.target".to_string()],
+        );
         systemd
-            .enabled_map
+            .active_set
             .borrow_mut()
-            .insert("app.service".to_string(), "enabled".to_string());
+            .insert("default.target".to_string());
         systemd.state_map.borrow_mut().insert(
             "app.service".to_string(),
             UnitState {
@@ -639,11 +645,15 @@ mod tests {
     fn activate_summary_lists_multiple_failures() {
         use super::super::systemd::UnitState;
         let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
         for unit in &["a.service", "b.service"] {
             systemd
-                .enabled_map
+                .reverse_deps_map
                 .borrow_mut()
-                .insert(unit.to_string(), "enabled".to_string());
+                .insert(unit.to_string(), vec!["default.target".to_string()]);
             systemd.state_map.borrow_mut().insert(
                 unit.to_string(),
                 UnitState {
@@ -674,10 +684,6 @@ mod tests {
     #[test]
     fn restart_verbose_logs_units() {
         let systemd = MockSystemd::new();
-        systemd
-            .enabled_map
-            .borrow_mut()
-            .insert("app.service".to_string(), "enabled".to_string());
         systemd
             .active_set
             .borrow_mut()

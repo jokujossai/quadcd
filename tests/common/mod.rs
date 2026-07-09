@@ -95,6 +95,9 @@ impl SystemdTrait for NoopSystemd {
     fn is_active(&self, _unit: &str, _cfg: &Config) -> bool {
         false
     }
+    fn reverse_deps(&self, _unit: &str, _cfg: &Config) -> Vec<String> {
+        vec![]
+    }
     fn list_units_matching(&self, _pattern: &str, _cfg: &Config) -> Vec<String> {
         vec![]
     }

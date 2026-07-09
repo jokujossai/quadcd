@@ -39,6 +39,24 @@ pub fn repos_dir() -> String {
     format!("/tmp/quadcd-test-repos-{uid}")
 }
 
+/// Boot target for `[Install] WantedBy=` in test fixtures.
+pub fn wanted_by() -> &'static str {
+    if is_user_mode() {
+        "default.target"
+    } else {
+        "multi-user.target"
+    }
+}
+
+/// A minimal always-succeeding oneshot service with an `[Install]` section,
+/// so quadcd's generator links it to the boot target and sync starts it.
+pub fn oneshot_unit() -> String {
+    format!(
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n\n[Install]\nWantedBy={}\n",
+        wanted_by()
+    )
+}
+
 pub const SERVICE_NAME: &str = "quadcd-sync.service";
 
 // ---------------------------------------------------------------------------

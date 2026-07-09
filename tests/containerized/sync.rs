@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
 use std::time::Duration;
 
 use crate::helpers::*;
@@ -15,13 +16,7 @@ use crate::helpers::*;
 fn service_initial_sync_clones_repo() {
     let _ctx = SyncTestContext::new();
 
-    let bare = create_bare_repo(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = create_bare_repo("myapp", &[("hello.service", oneshot_unit().as_str())]);
 
     fs::write(
         config_path(),
@@ -54,20 +49,8 @@ fn service_initial_sync_clones_repo() {
 fn service_config_reload_adds_repo() {
     let _ctx = SyncTestContext::new();
 
-    let bare_a = create_bare_repo(
-        "repo-a",
-        &[(
-            "a.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
-    let bare_b = create_bare_repo(
-        "repo-b",
-        &[(
-            "b.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare_a = create_bare_repo("repo-a", &[("a.service", oneshot_unit().as_str())]);
+    let bare_b = create_bare_repo("repo-b", &[("b.service", oneshot_unit().as_str())]);
 
     // Start with only repo-a
     fs::write(
@@ -113,20 +96,8 @@ fn service_config_reload_adds_repo() {
 fn service_config_reload_removes_repo() {
     let _ctx = SyncTestContext::new();
 
-    let bare_a = create_bare_repo(
-        "repo-a",
-        &[(
-            "a.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
-    let bare_b = create_bare_repo(
-        "repo-b",
-        &[(
-            "b.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare_a = create_bare_repo("repo-a", &[("a.service", oneshot_unit().as_str())]);
+    let bare_b = create_bare_repo("repo-b", &[("b.service", oneshot_unit().as_str())]);
 
     // Start with both repos using short intervals
     fs::write(
@@ -182,13 +153,7 @@ fn service_config_reload_removes_repo() {
 fn service_interval_pulls_updates() {
     let _ctx = SyncTestContext::new();
 
-    let bare = create_bare_repo(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = create_bare_repo("myapp", &[("hello.service", oneshot_unit().as_str())]);
 
     fs::write(
         config_path(),
@@ -227,13 +192,7 @@ fn service_interval_pulls_updates() {
 fn service_graceful_shutdown() {
     let _ctx = SyncTestContext::new();
 
-    let bare = create_bare_repo(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = create_bare_repo("myapp", &[("hello.service", oneshot_unit().as_str())]);
 
     fs::write(
         config_path(),
@@ -274,13 +233,7 @@ fn service_graceful_shutdown() {
 fn service_allows_concurrent_manual_sync() {
     let _ctx = SyncTestContext::new();
 
-    let bare = create_bare_repo(
-        "myapp",
-        &[(
-            "hello.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
-    );
+    let bare = create_bare_repo("myapp", &[("hello.service", oneshot_unit().as_str())]);
 
     fs::write(
         config_path(),
@@ -316,10 +269,7 @@ fn service_syncs_configured_branch() {
     let bare = create_bare_repo_on_branch(
         "myapp",
         "develop",
-        &[(
-            "dev.service",
-            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n",
-        )],
+        &[("dev.service", oneshot_unit().as_str())],
     );
 
     fs::write(
@@ -356,9 +306,14 @@ fn service_sync_reports_failed_quadlet_container() {
         "broken",
         &[(
             "broken.container",
-            "[Container]\n\
-             Image=localhost/quadcd-does-not-exist:nope\n\n\
-             [Service]\nRestart=no\n",
+            format!(
+                "[Container]\n\
+                 Image=localhost/quadcd-does-not-exist:nope\n\n\
+                 [Service]\nRestart=no\n\n\
+                 [Install]\nWantedBy={}\n",
+                wanted_by()
+            )
+            .as_str(),
         )],
     );
 
@@ -399,7 +354,11 @@ fn service_sync_reports_failed_service() {
         "myapp",
         &[(
             "crash.service",
-            "[Service]\nType=simple\nExecStart=/bin/false\n",
+            format!(
+                "[Service]\nType=simple\nExecStart=/bin/false\n\n[Install]\nWantedBy={}\n",
+                wanted_by()
+            )
+            .as_str(),
         )],
     );
 
@@ -426,6 +385,98 @@ fn service_sync_reports_failed_service() {
     assert!(
         journal_contains("30s ago", "service(s) failed after restart: crash.service"),
         "expected aggregated failure summary in sync journal"
+    );
+
+    assert!(is_service_active(), "sync service should still be running");
+}
+
+/// A volume unit without `[Install]` that is stopped should NOT be started
+/// when its file is updated during sync.  Only explicitly enabled units
+/// should be auto-started; generated/static units are dependency-activated.
+#[test]
+#[ignore]
+fn service_sync_does_not_start_stopped_generated_unit() {
+    let _ctx = SyncTestContext::new();
+
+    // A volume without [Install] — systemd reports it as "generated".
+    let bare = create_bare_repo(
+        "myapp",
+        &[
+            ("data.volume", "[Volume]\nLabel=quadcd-test-data\n"),
+            (
+                "hello.container",
+                "[Container]\n\
+                 Image=docker.io/library/alpine:latest\n\
+                 Exec=/bin/true\n\
+                 Volume=data.volume:/data\n\n\
+                 [Install]\nWantedBy=default.target\n",
+            ),
+        ],
+    );
+
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.myapp]\nurl = \"{}\"\ninterval = \"2s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    start_sync_service();
+
+    wait_for_file("myapp", "data.volume", Duration::from_secs(10));
+    wait_for_file("myapp", "hello.container", Duration::from_secs(10));
+
+    // Wait for the container (and thus the volume) to have been started.
+    wait_for_unit_start("hello.service", Duration::from_secs(30));
+    wait_for_unit_start("data-volume.service", Duration::from_secs(10));
+
+    // Stop the volume unit manually.
+    assert!(
+        systemctl(&["stop", "data-volume.service"]),
+        "failed to stop data-volume.service"
+    );
+    // Also stop the container so the volume isn't pulled back in.
+    assert!(
+        systemctl(&["stop", "hello.service"]),
+        "failed to stop hello.service"
+    );
+
+    // Confirm it is stopped.
+    assert!(
+        !systemctl(&["is-active", "--quiet", "data-volume.service"]),
+        "data-volume.service should be inactive after stop"
+    );
+
+    // Push an update to the volume file — the content changes but there
+    // is still no [Install] section.
+    push_commit(
+        &bare,
+        &[("data.volume", "[Volume]\nLabel=quadcd-test-data-v2\n")],
+        "update volume label",
+    );
+
+    // Wait for the sync to pick up the new commit.
+    wait_until(
+        Duration::from_secs(15),
+        "sync to pick up volume update",
+        || {
+            let content = fs::read_to_string(PathBuf::from(data_dir()).join("myapp/data.volume"));
+            content
+                .as_ref()
+                .map(|c| c.contains("quadcd-test-data-v2"))
+                .unwrap_or(false)
+        },
+    );
+
+    // Give sync a moment to (incorrectly) start the unit if the bug is present.
+    thread::sleep(Duration::from_secs(3));
+
+    // The volume unit should still be stopped — sync must NOT start it.
+    assert!(
+        !systemctl(&["is-active", "--quiet", "data-volume.service"]),
+        "data-volume.service should NOT have been started by sync (no [Install] and was stopped)"
     );
 
     assert!(is_service_active(), "sync service should still be running");
