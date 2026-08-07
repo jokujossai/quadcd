@@ -113,7 +113,7 @@ jobs:
           disable_annotations: true
 
       - name: Build
-        uses: zijiren233/cargo-cross@dc2713022cd64db78feb2fb11b089381d069d605 # v1.5.1
+        uses: zijiren233/cargo-cross@b9420a4b4da488f33376bb4e1172a2f02072ae94 # v1.6.0
         with:
           command: build
           targets: |
@@ -122,7 +122,7 @@ jobs:
           crt-static: true
 
       - name: Build containerized integration test binary
-        uses: zijiren233/cargo-cross@dc2713022cd64db78feb2fb11b089381d069d605 # v1.5.1
+        uses: zijiren233/cargo-cross@b9420a4b4da488f33376bb4e1172a2f02072ae94 # v1.6.0
         with:
           command: test
           target: x86_64-unknown-linux-musl
