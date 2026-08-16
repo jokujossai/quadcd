@@ -48,6 +48,99 @@ impl UnitState {
     }
 }
 
+/// `systemctl show` properties naming the units that, when active, would cause
+/// systemd to start this unit.
+///
+/// These are the reverse (`…By`/`…Of`) dependency properties systemd derives
+/// automatically from the forward setting on the *other* unit; they cannot be
+/// written directly. Every property here has the same meaning for sync — "an
+/// active unit over there implies this unit belongs running" — which is what
+/// lets [`parse_reverse_deps`] union them into one flat list.
+///
+/// **Included**
+/// - `WantedBy` (inverse of `Wants=`) and `RequiredBy` (inverse of
+///   `Requires=`): the `[Install]` relationships, materialised as
+///   `.wants/`/`.requires/` symlinks. Starting the dependant pulls this unit
+///   in; at boot that dependant is typically `default.target`.
+/// - `BoundBy` (inverse of `BindsTo=`): `BindsTo=` is `Requires=` plus
+///   propagated stop, so an active binder starts this unit exactly as a
+///   requirer would (and would stop again without it).
+/// - `UpheldBy` (inverse of `Upholds=`): "as long as this unit is up, all
+///   units listed in `Upholds=` are started whenever found to be inactive or
+///   failed". An active upholder is the strongest possible statement that
+///   this unit should be running — systemd would restart it continuously.
+///
+/// **Deliberately excluded**
+/// - `ConsistsOf` (inverse of `PartOf=`): `PartOf=` configures dependencies
+///   "similar to `Requires=`, but limited to stopping and restarting of
+///   units". It never propagates a *start*, so an active `PartOf=` parent
+///   says nothing about whether this unit should run — including it would
+///   start units a reboot would leave stopped, which is exactly the state
+///   divergence sync is trying to avoid.
+/// - `RequisiteOf` (inverse of `Requisite=`): `Requisite=` deliberately does
+///   not start the unit; it fails the *dependant* if this unit is not
+///   already active. So an active requisite-of unit is evidence this unit was
+///   already up, not a reason to start it.
+/// - `TriggeredBy` (`.socket`/`.timer`/`.path` units): the entire point of
+///   socket, timer and path activation is that the service starts on demand.
+///   An active `.socket` means the service is *ready to be* started, and boot
+///   leaves it inactive — starting it during sync would diverge from the
+///   state a reboot produces. See the note in `plan_activation` about the
+///   pre-pull side of this trade-off.
+///
+///   This does not make sync ignore triggered services: `plan_activation`
+///   tests `is_active` first and short-circuits, so a socket-activated
+///   service that happens to be running when its file changes is restarted
+///   like any other active unit. This property set only ever gates the
+///   *inactive* branch.
+/// - `ConflictedBy` (inverse of `Conflicts=`): a negative relationship. An
+///   active conflicting unit forces this one *stopped*.
+/// - `StopPropagatedFrom`/`ReloadPropagatedFrom` (inverses of
+///   `PropagatesStopTo=`/`PropagatesReloadTo=`): propagate stop and reload
+///   respectively, never start.
+/// - `Before`/`After`: pure ordering. They constrain *when* a unit starts
+///   relative to another, never *whether* it starts at all.
+///
+/// The names must match systemd's spelling exactly. `systemctl show` fetches
+/// the unit's properties over D-Bus and filters the reply against the names
+/// asked for, so a name the running systemd does not know simply matches
+/// nothing: no line is emitted for it and the exit status is still 0. A typo
+/// would therefore degrade silently to "no reverse dependencies" rather than
+/// failing loudly. The names are verified against `systemd.unit(5)` and the
+/// `org.freedesktop.systemd1` `Unit` interface.
+///
+/// The same mechanism makes an old systemd degrade gracefully: `UpheldBy`
+/// arrived in systemd 249, and below that it contributes nothing instead of
+/// erroring.
+const START_AUTHORISING_PROPERTIES: [&str; 4] = ["WantedBy", "RequiredBy", "BoundBy", "UpheldBy"];
+
+/// Parse the unit names out of a `systemctl show --value` listing of
+/// [`START_AUTHORISING_PROPERTIES`].
+///
+/// Splitting the whole output on whitespace unions the properties, which is
+/// only sound because every queried property authorises a start identically —
+/// none of them needs to be told apart from the others. `--value` prints bare
+/// values in systemd's own property order, one line per property, with nothing
+/// to say which line is which: a property that is *known but empty* emits a
+/// blank line, and a property the running systemd does not implement (such as
+/// `UpheldBy` before systemd 249) emits no line at all, silently shifting
+/// every later line up. Positions are therefore unusable, and a property
+/// needing different treatment would have to be fetched without `--value` and
+/// parsed as `KEY=value` lines instead. The union is immune to both cases.
+///
+/// Unit names never contain whitespace, so the split is unambiguous. Results
+/// are deduplicated: a unit that both wants and requires this one is listed by
+/// two properties but is a single reverse dependency.
+fn parse_reverse_deps(stdout: &str) -> Vec<String> {
+    let mut deps: Vec<String> = Vec::new();
+    for name in stdout.split_whitespace() {
+        if !deps.iter().any(|d| d == name) {
+            deps.push(name.to_string());
+        }
+    }
+    deps
+}
+
 /// Abstraction over systemctl operations.
 ///
 /// `Systemd` shells out to systemctl; tests can substitute a mock that records
@@ -62,9 +155,11 @@ pub trait SystemdTrait {
     fn is_enabled(&self, unit: &str, cfg: &Config) -> String;
     /// Return `true` if the unit is currently active (running).
     fn is_active(&self, unit: &str, cfg: &Config) -> bool;
-    /// Return the units that want or require this unit (`WantedBy=` plus
-    /// `RequiredBy=` from `systemctl show`), including targets linked via
-    /// generator `.wants`/`.requires` symlinks. Empty on error.
+    /// Return the units whose activation would make systemd start this unit:
+    /// the reverse dependencies `WantedBy`, `RequiredBy`, `BoundBy` and
+    /// `UpheldBy` (see `START_AUTHORISING_PROPERTIES` for why those four and
+    /// no others), including targets linked via generator
+    /// `.wants`/`.requires` symlinks. Deduplicated; empty on error.
     fn reverse_deps(&self, unit: &str, cfg: &Config) -> Vec<String>;
     /// List loaded unit names matching a glob pattern (e.g. "foo@*.service").
     fn list_units_matching(&self, pattern: &str, cfg: &Config) -> Vec<String>;
@@ -278,20 +373,26 @@ impl SystemdTrait for Systemd {
     }
 
     fn reverse_deps(&self, unit: &str, cfg: &Config) -> Vec<String> {
-        let mut args = Self::user_args(cfg);
-        args.extend([
-            "show",
-            unit,
-            "--property=WantedBy",
-            "--property=RequiredBy",
-            "--value",
-        ]);
+        // Owned args here (unlike the other methods): the `--property=` flags
+        // are built from START_AUTHORISING_PROPERTIES so the property list has
+        // exactly one definition.
+        let mut args: Vec<String> = Self::user_args(cfg)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        args.push("show".to_string());
+        args.push(unit.to_string());
+        args.extend(
+            START_AUTHORISING_PROPERTIES
+                .iter()
+                .map(|p| format!("--property={p}")),
+        );
+        args.push("--value".to_string());
 
-        match self.exec().args(args.iter().copied()).capture() {
-            Ok(capture) if capture.success() => String::from_utf8_lossy(&capture.stdout)
-                .split_whitespace()
-                .map(str::to_string)
-                .collect(),
+        match self.exec().args(&args).capture() {
+            Ok(capture) if capture.success() => {
+                parse_reverse_deps(&String::from_utf8_lossy(&capture.stdout))
+            }
             _ => Vec::new(),
         }
     }
@@ -361,6 +462,99 @@ impl SystemdTrait for Systemd {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_deps_properties_exclude_non_starting_relationships() {
+        // `PartOf=`/`Requisite=` never start a unit, socket/timer activation is
+        // on demand, and `Conflicts=` stops it. See the const's documentation.
+        for excluded in [
+            "ConsistsOf",
+            "RequisiteOf",
+            "TriggeredBy",
+            "ConflictedBy",
+            "StopPropagatedFrom",
+            "ReloadPropagatedFrom",
+        ] {
+            assert!(
+                !START_AUTHORISING_PROPERTIES.contains(&excluded),
+                "{excluded} must not authorise a start"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_reverse_deps_unions_all_properties() {
+        // `systemctl show -p WantedBy -p RequiredBy -p BoundBy -p UpheldBy
+        // --value` emits one line per property, in systemd's own order.
+        let stdout = "default.target\nconsumer.service\nbinder.service\nsupervisor.service\n";
+        assert_eq!(
+            parse_reverse_deps(stdout),
+            vec![
+                "default.target".to_string(),
+                "consumer.service".to_string(),
+                "binder.service".to_string(),
+                "supervisor.service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_reverse_deps_handles_multiple_units_per_property() {
+        // `WantedBy` names two targets on one line; `BoundBy` and `UpheldBy`
+        // are known but empty and contribute the two trailing blank lines.
+        let stdout = "multi-user.target default.target\nconsumer.service\n\n\n";
+        assert_eq!(
+            parse_reverse_deps(stdout),
+            vec![
+                "multi-user.target".to_string(),
+                "default.target".to_string(),
+                "consumer.service".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_reverse_deps_skips_empty_properties() {
+        // Only `UpheldBy` is populated; the three properties that are known
+        // but empty emit blank lines that must not become dependency names.
+        assert_eq!(
+            parse_reverse_deps("\n\n\nsupervisor.service\n"),
+            vec!["supervisor.service".to_string()]
+        );
+        assert_eq!(parse_reverse_deps("\n\n\n\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_reverse_deps_handles_properties_the_systemd_does_not_implement() {
+        // `systemctl show` filters the D-Bus reply against the requested
+        // names, so a property this systemd does not know emits *no* line
+        // rather than a blank one. On systemd < 249 `UpheldBy` does not exist,
+        // so only three lines come back — the union does not care that the
+        // remaining lines shifted up.
+        assert_eq!(
+            parse_reverse_deps("default.target\n\n\n"),
+            vec!["default.target".to_string()]
+        );
+        // A hypothetical systemd knowing none of the four (or a typo in every
+        // name) yields no output at all, which is the intended fail-closed
+        // "no reverse dependencies".
+        assert_eq!(parse_reverse_deps(""), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_reverse_deps_deduplicates_across_properties() {
+        // A unit that both wants and requires this one appears in two
+        // properties but is a single reverse dependency.
+        assert_eq!(
+            parse_reverse_deps("app.target\napp.target\napp.target\n\n"),
+            vec!["app.target".to_string()]
+        );
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::new_without_default)]
 pub mod testing {
@@ -378,6 +572,11 @@ pub mod testing {
         pub call_log: RefCell<Vec<String>>,
         pub enabled_map: RefCell<HashMap<String, String>>,
         pub active_set: RefCell<HashSet<String>>,
+        /// Canned [`SystemdTrait::reverse_deps`] answers. Flat lists, like the
+        /// real implementation: every start-authorising relationship it
+        /// queries authorises a start identically, so there is nothing for a
+        /// test to tell apart here — a `WantedBy` entry and an `UpheldBy`
+        /// entry are indistinguishable by construction.
         pub reverse_deps_map: RefCell<HashMap<String, Vec<String>>>,
         pub listed_units: RefCell<HashMap<String, Vec<String>>>,
         pub state_map: RefCell<HashMap<String, UnitState>>,

@@ -75,6 +75,14 @@ pub(crate) struct ActivationPlan {
     /// those systemd pulls in as a dependency of a unit being activated.
     /// Templates appear un-instantiated (`foo@.service`) so a changed file
     /// always maps back to a single entry.
+    ///
+    /// This doubles as the pre-pull set, so "will be running" and "should
+    /// have its image on disk" are currently one and the same decision. They
+    /// are not identical in principle — a socket-activated service will not
+    /// be started by sync, yet its image is plausibly wanted soon — but
+    /// splitting them would need a second set threaded through the plan, and
+    /// the conservative answer (no start, no pre-pull) is the one that keeps
+    /// sync's post-run state equal to a reboot's.
     activating: HashSet<String>,
     /// Verbose lines describing the decisions, emitted by
     /// [`execute_activation`] rather than at planning time so a plan can be
@@ -107,13 +115,25 @@ impl ActivationPlan {
 ///   `list-units` and restart them.
 /// - **Active** units: `restart` — a running unit whose file changed keeps
 ///   running with the new configuration.
-/// - **Inactive** units: `start` only if some unit that wants or requires
-///   them is active. This mirrors boot: quadcd-deployed units are all
-///   `generated`, so the only thing that starts them at boot is a
-///   `.wants`/`.requires` link from an active unit (typically
-///   `default.target`, materialised from `[Install]`). Anything else —
-///   including units an operator stopped by hand — is left alone, so sync
+/// - **Inactive** units: `start` only if some unit whose own activation would
+///   drag them up is active — `Wants=`, `Requires=`, `BindsTo=` or
+///   `Upholds=`, seen from this side as the reverse properties in
+///   `START_AUTHORISING_PROPERTIES`. This mirrors boot: quadcd-deployed units
+///   are all `generated`, so what starts them at boot is another unit
+///   declaring one of those relationships (typically `default.target` via a
+///   `.wants`/`.requires` link materialised from `[Install]`). Anything else
+///   — including units an operator stopped by hand — is left alone, so sync
 ///   never creates a running state that a reboot would not reproduce.
+///
+///   Relationships that do *not* start a unit are excluded, so `PartOf=`
+///   (stop/restart propagation only) and `Requisite=` never cause a start
+///   here. Socket-, timer- and path-activated services (`TriggeredBy`) are
+///   also left alone *while inactive*: boot leaves them stopped until the
+///   trigger fires, and starting them eagerly would diverge from that. One
+///   that happens to be running is caught by the active branch above and
+///   restarted like anything else. The cost is that an inactive triggered
+///   service's image is not pre-pulled either, since this same classification
+///   decides the pre-pull — see the note on `ActivationPlan::activating`.
 ///
 /// Planning performs no systemd state changes and logs nothing; the verbose
 /// account of the decisions is stored on the plan and written out by
@@ -131,9 +151,9 @@ pub(crate) fn plan_activation(
     units.dedup();
 
     let mut plan = ActivationPlan::default();
-    // Units left alone, with the reverse dependencies that failed to justify
-    // starting them. Revisited below: a dependant this plan activates will
-    // drag them in even though sync does not name them itself.
+    // Units left alone, with the start-authorising reverse dependencies that
+    // failed to justify starting them. Revisited below: a dependant this plan
+    // activates will drag them in even though sync does not name them itself.
     let mut skipped: Vec<(String, Vec<String>)> = Vec::new();
     // `default.target` is usually the reverse dependency of every changed
     // unit, and each lookup spawns a `systemctl is-active`.
@@ -168,10 +188,11 @@ pub(crate) fn plan_activation(
             continue;
         }
 
-        // Inactive: start only if boot would — i.e. something that wants or
-        // requires this unit is itself active. `[Install]` links show up
-        // here as active targets (e.g. default.target); a unit nothing
-        // depends on, or one whose dependants are stopped, stays stopped.
+        // Inactive: start only if boot would — i.e. some unit that would
+        // itself start this one (wants, requires, binds to, or upholds it) is
+        // active. `[Install]` links show up here as active targets (e.g.
+        // default.target); a unit nothing depends on, or one whose dependants
+        // are stopped, stays stopped.
         let deps = systemd.reverse_deps(unit, cfg);
         if deps.iter().any(|dep| active.is_active(dep, cfg)) {
             plan.to_start.push(unit.clone());
@@ -186,7 +207,7 @@ pub(crate) fn plan_activation(
     for (unit, deps) in &skipped {
         plan.note(cfg, || {
             format!(
-                "Skipping inactive {unit} (not wanted by any active unit; wanted/required by: [{}])",
+                "Skipping inactive {unit} (no active unit would start it; would be started by: [{}])",
                 deps.join(", ")
             )
         });
@@ -226,8 +247,9 @@ impl<'a> ActiveStates<'a> {
 /// `activating` set.
 ///
 /// A skipped unit is not started by sync, but if something sync *is*
-/// activating wants or requires it, systemd brings it up in the same
-/// transaction — just as boot would. `web.image` required by a `web.container`
+/// activating would start it — wants, requires, binds to or upholds it —
+/// systemd brings it up in the same transaction, just as boot would.
+/// `web.image` required by a `web.container`
 /// being started is the common case: its image still has to be pre-pulled, or
 /// the download lands inline during unit start.
 ///
@@ -587,9 +609,22 @@ mod tests {
     #[case::inactive_required_by_active_unit(&["consumer.service"], &["consumer.service"], false, "start")]
     #[case::inactive_wanted_by_inactive_unit(&["consumer.service"], &[], false, "skip")]
     #[case::inactive_one_of_many_deps_active(&["a.service", "b.target"], &["b.target"], false, "start")]
+    // `BoundBy` (reverse of `BindsTo=`): the binder starts this unit exactly
+    // as a requirer would, so an active binder authorises the start.
+    #[case::inactive_bound_by_active_unit(&["binder.service"], &["binder.service"], false, "start")]
+    #[case::inactive_bound_by_inactive_unit(&["binder.service"], &[], false, "skip")]
+    // `UpheldBy` (reverse of `Upholds=`): an active upholder restarts this
+    // unit continuously while inactive or failed, so leaving it stopped would
+    // be a state systemd itself refuses to hold.
+    #[case::inactive_upheld_by_active_unit(&["supervisor.service"], &["supervisor.service"], false, "start")]
+    #[case::inactive_upheld_by_inactive_unit(&["supervisor.service"], &[], false, "skip")]
     #[case::inactive_without_deps_skipped(&[], &[], false, "skip")]
     #[case::active_without_deps_restarts(&[], &[], true, "restart")]
     #[case::active_with_inactive_deps_restarts(&["consumer.service"], &[], true, "restart")]
+    // `reverse_deps` returns the union of the start-authorising properties, so
+    // which one a name arrived through is invisible here by design; the case
+    // names record the intent. Which properties are queried in the first place
+    // is asserted in `sync::systemd`'s own tests.
     fn activate_unit_by_state(
         #[case] reverse_deps: &[&str],
         #[case] active_deps: &[&str],
@@ -635,6 +670,54 @@ mod tests {
             }
             _ => panic!("unknown expected action: {expected}"),
         }
+    }
+
+    // Note on what is *not* tested here. The relationships that must never
+    // authorise a start — `ConsistsOf` (`PartOf=`), `TriggeredBy` (socket,
+    // timer and path activation), `RequisiteOf` (`Requisite=`) and the rest —
+    // cannot be pinned at this level: `MockSystemd::reverse_deps_map` returns
+    // whatever a test puts in it, so a unit with no reverse dependencies stays
+    // stopped regardless of which properties the real `reverse_deps` asks
+    // systemctl for. A test here would pass even if `TriggeredBy` were added
+    // to the queried set. The exclusions are pinned where they are decided
+    // instead: `reverse_deps_properties_exclude_non_starting_relationships` in
+    // `sync::systemd` guards the property list, and
+    // `reverse_deps_queries_only_start_authorising_properties` in
+    // `tests/fake_systemd.rs` guards the systemctl arguments actually sent.
+
+    #[test]
+    fn plan_activates_unit_upheld_by_a_started_unit() {
+        // `helper.service` is `Upholds=`-ed by `web.service`, which is itself
+        // inactive but wanted by an active `default.target`. Starting
+        // `web.service` makes systemd bring `helper.service` up too, so its
+        // image has to be pre-pulled.
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "web.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "helper.service".to_string(),
+            vec!["web.service".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &["web.container".into(), "helper.container".into()],
+            &cfg,
+        );
+
+        assert!(plan.activates_file("web.container"));
+        assert!(plan.activates_file("helper.container"));
+
+        // systemd upholds it; sync must not name it in the start command.
+        execute_activation(&systemd, &plan, &cfg);
+        assert_eq!(systemd.started.borrow().as_slice(), &["web.service"]);
     }
 
     // plan_activation / ActivationPlan::activates_file
