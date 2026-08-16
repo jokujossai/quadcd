@@ -17,7 +17,9 @@ use crate::install;
 use super::image::{dedup_images, extract_images, ImagePuller, ImageRef};
 use super::repo::{safe_repo_dir, sync_repo_inner, SyncResult, SyncStatus};
 use super::systemd::SystemdTrait;
-use super::units::{activate_changed_units_inner, all_unit_files, stop_deleted_units_inner};
+use super::units::{
+    all_unit_files, execute_activation, plan_activation, stop_deleted_units_inner, ActivationPlan,
+};
 use super::vcs::{UnitChanges, Vcs};
 
 #[derive(Default)]
@@ -144,13 +146,21 @@ impl<'a> SyncRunner<'a> {
     /// Reads `Image=` lines from the source files in each repo directory,
     /// applies variable substitution, and pulls each unique image so that
     /// restarts don't incur image download time.
-    pub(crate) fn pre_pull_images(&self, changed_files: &[String]) {
+    ///
+    /// Returns `true` if a pull was attempted — that is, if any of `files`
+    /// yielded an image reference. `ImagePuller::pull` reports failures
+    /// itself, so a `true` here does not promise the image is now local.
+    pub(crate) fn pre_pull_images(&self, files: &[String]) -> bool {
+        if files.is_empty() {
+            return false;
+        }
+
         let source_dirs = self.cfg.effective_source_dirs();
         let mut all_images: Vec<ImageRef> = Vec::new();
 
         for (source_dir, env_vars) in &source_dirs {
             all_images.extend(extract_images(
-                changed_files,
+                files,
                 source_dir,
                 env_vars,
                 self.cfg.verbose,
@@ -163,12 +173,37 @@ impl<'a> SyncRunner<'a> {
         for image in &all_images {
             self.image_puller.pull(image, self.cfg);
         }
+
+        !all_images.is_empty()
     }
 
-    /// Restart changed units using `self.systemd`. Returns the list of units
-    /// that failed to reach an active/activating state after restart.
-    pub(crate) fn restart_changed_units(&self, changed_files: &[String]) -> Vec<String> {
-        activate_changed_units_inner(self.systemd, changed_files, self.cfg)
+    /// The image-bearing files among `changed_files` whose unit `plan` will
+    /// leave running, i.e. the ones worth pre-pulling.
+    fn files_worth_pulling(changed_files: &[String], plan: &ActivationPlan) -> Vec<String> {
+        changed_files
+            .iter()
+            .filter(|f| Self::may_carry_image(f) && plan.activates_file(f))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether a changed file is one pre-pull looks at all. Mirrors the
+    /// extension check in `extract_images`; used to keep the skip report
+    /// about images rather than about every unit that stays stopped.
+    fn may_carry_image(filename: &str) -> bool {
+        filename.ends_with(".container") || filename.ends_with(".image")
+    }
+
+    /// Decide how the changed units should be activated. Must run after
+    /// `daemon-reload` so systemd reports the updated unit files.
+    pub(crate) fn plan_activation(&self, changed_files: &[String]) -> ActivationPlan {
+        plan_activation(self.systemd, changed_files, self.cfg)
+    }
+
+    /// Start or restart the planned units using `self.systemd`. Returns the
+    /// list of units that failed to reach an active/activating state.
+    pub(crate) fn execute_activation(&self, plan: &ActivationPlan) -> Vec<String> {
+        execute_activation(self.systemd, plan, self.cfg)
     }
 
     /// Stop units whose backing files were deleted by the sync.
@@ -260,8 +295,9 @@ impl<'a> SyncRunner<'a> {
     ///
     /// Order matters: deleted units must be stopped **before** `daemon-reload`
     /// so systemd can still locate them; otherwise the underlying containers
-    /// or processes become orphaned. After the reload, images for changed
-    /// units are pre-pulled and the changed units are started or restarted.
+    /// or processes become orphaned. After the reload, the activation plan is
+    /// computed, images for the units it will activate are pre-pulled, and the
+    /// plan is executed.
     ///
     /// No-op when `changes` is empty. In sync-only mode, logs the changes but
     /// skips all systemd interaction.
@@ -288,8 +324,49 @@ impl<'a> SyncRunner<'a> {
         }
         self.stop_deleted_units(&changes.deleted);
         self.systemd.daemon_reload(self.cfg);
-        self.pre_pull_images(&changes.changed);
-        let _failed = self.restart_changed_units(&changes.changed);
+
+        let plan = self.plan_activation(&changes.changed);
+        let mut pulled = Self::files_worth_pulling(&changes.changed, &plan);
+        // A pull can take minutes, during which an operator may stop or start
+        // something. Re-plan afterwards so the units acted on reflect the
+        // state at that moment rather than the state the pull decision was
+        // made on, and pull for whatever the new plan added. Planning is
+        // read-only and silent, so repeating it costs no duplicate output.
+        let plan = if self.pre_pull_images(&pulled) {
+            let replanned = self.plan_activation(&changes.changed);
+            let added: Vec<String> = Self::files_worth_pulling(&changes.changed, &replanned)
+                .into_iter()
+                .filter(|f| !pulled.contains(f))
+                .collect();
+            // One extra round only: this pull can be slow too, and chasing
+            // the state forever would never reach activation.
+            self.pre_pull_images(&added);
+            pulled.extend(added);
+            replanned
+        } else {
+            plan
+        };
+
+        if self.cfg.verbose {
+            let skipped: Vec<&String> = changes
+                .changed
+                .iter()
+                .filter(|f| Self::may_carry_image(f) && !pulled.contains(f))
+                .collect();
+            if !skipped.is_empty() {
+                let _ = writeln!(
+                    self.cfg.output.err(),
+                    "[quadcd] Skipping image pre-pull for units that will not be activated: {}",
+                    skipped
+                        .iter()
+                        .map(|f| f.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+        }
+
+        let _failed = self.execute_activation(&plan);
     }
 
     /// One-shot sync: sync all repos, daemon-reload, then restart changed units.
@@ -741,6 +818,7 @@ mod tests {
     use crate::cd_config::RepoConfig;
     use crate::config::test_config;
     use notify::EventKind;
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
@@ -750,6 +828,142 @@ mod tests {
     use super::super::image::testing::MockImagePuller;
     use super::super::systemd::testing::MockSystemd;
     use super::super::vcs::testing::MockVcs;
+
+    // apply_changes: pull / re-plan sequencing
+    //
+    // A real pull takes long enough for unit state to move under sync. These
+    // tests use a puller that mutates the mock systemd while "downloading",
+    // which is the only way to observe that the plan is recomputed.
+
+    /// Image puller that applies `on_pull` to the systemd mock the first time
+    /// it pulls, simulating state changing during a slow download.
+    struct StateChangingPuller<'a> {
+        systemd: &'a MockSystemd,
+        pulled: RefCell<Vec<String>>,
+        on_pull: Box<dyn Fn(&MockSystemd) + 'a>,
+    }
+
+    impl<'a> StateChangingPuller<'a> {
+        fn new(systemd: &'a MockSystemd, on_pull: impl Fn(&MockSystemd) + 'a) -> Self {
+            Self {
+                systemd,
+                pulled: RefCell::new(Vec::new()),
+                on_pull: Box::new(on_pull),
+            }
+        }
+    }
+
+    impl ImagePuller for StateChangingPuller<'_> {
+        fn pull(&self, image: &ImageRef, _cfg: &Config) {
+            if self.pulled.borrow().is_empty() {
+                (self.on_pull)(self.systemd);
+            }
+            self.pulled.borrow_mut().push(image.image.clone());
+        }
+    }
+
+    /// Write a repo dir with the given files under `data_dir`, so
+    /// `effective_source_dirs` picks them up.
+    fn write_repo(data_dir: &Path, files: &[(&str, &str)]) {
+        let repo_dir = data_dir.join("myrepo");
+        fs::create_dir_all(&repo_dir).unwrap();
+        for (name, content) in files {
+            fs::write(repo_dir.join(name), content).unwrap();
+        }
+    }
+
+    #[test]
+    fn apply_changes_does_not_restart_a_unit_stopped_during_the_pull() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+        cfg.data_dir = tmp.path().to_path_buf();
+        write_repo(
+            tmp.path(),
+            &[(
+                "app.container",
+                "[Container]\nImage=quay.io/podman/hello:latest\n",
+            )],
+        );
+
+        let vcs = MockVcs::new();
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        // The operator stops the unit while the image is downloading.
+        let puller = StateChangingPuller::new(&systemd, |systemd| {
+            systemd.active_set.borrow_mut().remove("app.service");
+        });
+
+        let runner = SyncRunner::new(&cfg, &vcs, &systemd, &puller);
+        runner.apply_changes(&UnitChanges {
+            changed: vec!["app.container".to_string()],
+            deleted: Vec::new(),
+        });
+
+        assert_eq!(puller.pulled.borrow().len(), 1, "the image is pre-pulled");
+        assert!(
+            systemd.restarted.borrow().is_empty(),
+            "a unit stopped during the pull must not be resurrected"
+        );
+        assert!(systemd.started.borrow().is_empty());
+    }
+
+    #[test]
+    fn apply_changes_pulls_for_a_unit_the_re_plan_adds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+        cfg.data_dir = tmp.path().to_path_buf();
+        write_repo(
+            tmp.path(),
+            &[
+                (
+                    "app.container",
+                    "[Container]\nImage=quay.io/podman/hello:latest\n",
+                ),
+                (
+                    "idle.container",
+                    "[Container]\nImage=quay.io/podman/idle:latest\n",
+                ),
+            ],
+        );
+
+        let vcs = MockVcs::new();
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        systemd
+            .reverse_deps_map
+            .borrow_mut()
+            .insert("idle.service".to_string(), vec!["late.target".to_string()]);
+        // The target that wants `idle.service` comes up during the pull, so
+        // the second plan starts it — with its image pulled after all.
+        let puller = StateChangingPuller::new(&systemd, |systemd| {
+            systemd
+                .active_set
+                .borrow_mut()
+                .insert("late.target".to_string());
+        });
+
+        let runner = SyncRunner::new(&cfg, &vcs, &systemd, &puller);
+        runner.apply_changes(&UnitChanges {
+            changed: vec!["app.container".to_string(), "idle.container".to_string()],
+            deleted: Vec::new(),
+        });
+
+        assert_eq!(
+            puller.pulled.borrow().as_slice(),
+            &[
+                "quay.io/podman/hello:latest".to_string(),
+                "quay.io/podman/idle:latest".to_string()
+            ],
+            "the unit the re-plan added must get its image too"
+        );
+        assert_eq!(systemd.started.borrow().as_slice(), &["idle.service"]);
+    }
 
     // service_tick
 
