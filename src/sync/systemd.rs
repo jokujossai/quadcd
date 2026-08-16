@@ -162,6 +162,10 @@ pub trait SystemdTrait {
     /// `.wants`/`.requires` symlinks. Deduplicated; empty on error.
     fn reverse_deps(&self, unit: &str, cfg: &Config) -> Vec<String>;
     /// List loaded unit names matching a glob pattern (e.g. "foo@*.service").
+    ///
+    /// Backed by `list-units --all`, so inactive and failed units are
+    /// reported alongside running ones: callers that care about the state —
+    /// activation does, stopping does not — must check it themselves.
     fn list_units_matching(&self, pattern: &str, cfg: &Config) -> Vec<String>;
     /// Return the unit's `ActiveState`, `SubState`, and `Result` via
     /// `systemctl show`. Returns `UnitState::unknown()` if the call fails.

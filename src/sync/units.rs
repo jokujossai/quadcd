@@ -111,8 +111,6 @@ impl ActivationPlan {
 ///
 /// Must run **after** `daemon-reload` so the systemd queries below see the
 /// updated unit files. Each changed unit is inspected:
-/// - **Templates** (`foo@.service`): discover running instances via
-///   `list-units` and restart them.
 /// - **Active** units: `restart` — a running unit whose file changed keeps
 ///   running with the new configuration.
 /// - **Inactive** units: `start` only if some unit whose own activation would
@@ -124,6 +122,11 @@ impl ActivationPlan {
 ///   `.wants`/`.requires` link materialised from `[Install]`). Anything else
 ///   — including units an operator stopped by hand — is left alone, so sync
 ///   never creates a running state that a reboot would not reproduce.
+/// - **Templates** (`foo@.service`): expanded to their loaded instances via
+///   `list-units`, and each instance is then judged by the two rules above.
+///   A template is not itself startable, so it never appears in the action
+///   lists; an instance an operator stopped (or one that failed and nothing
+///   active wants) is left alone exactly like a stopped regular unit.
 ///
 ///   Relationships that do *not* start a unit are excluded, so `PartOf=`
 ///   (stop/restart propagation only) and `Requisite=` never cause a start
@@ -155,54 +158,63 @@ pub(crate) fn plan_activation(
     // failed to justify starting them. Revisited below: a dependant this plan
     // activates will drag them in even though sync does not name them itself.
     let mut skipped: Vec<(String, Vec<String>)> = Vec::new();
+    // Instance name -> the changed template it came from, so activating an
+    // instance can mark the template file for pre-pull.
+    let mut templates: HashMap<String, String> = HashMap::new();
     // `default.target` is usually the reverse dependency of every changed
     // unit, and each lookup spawns a `systemctl is-active`.
     let mut active = ActiveStates::new(systemd);
 
     for unit in &units {
         if is_template_unit(unit) {
-            // Discover running instances for this template
+            // A template itself cannot be started; expand it to the
+            // instances systemd currently has loaded and judge each of them
+            // by the same rules as a regular unit.
             let pattern = unit.replace("@.", "@*.");
             let instances = systemd.list_units_matching(&pattern, cfg);
             if instances.is_empty() {
-                plan.note(cfg, || {
-                    format!("Template {unit}: no running instances found")
-                });
-            } else {
+                plan.note(cfg, || format!("Template {unit}: no loaded instances"));
+                continue;
+            }
+            let mut restarting: Vec<String> = Vec::new();
+            for instance in instances {
+                templates.insert(instance.clone(), unit.clone());
+                if plan_unit(
+                    systemd,
+                    &instance,
+                    &templates,
+                    &mut plan,
+                    &mut active,
+                    &mut skipped,
+                    cfg,
+                ) == Action::Restart
+                {
+                    restarting.push(instance);
+                }
+            }
+            if !restarting.is_empty() {
                 plan.note(cfg, || {
                     format!(
-                        "Template {unit}: restarting instances: {}",
-                        instances.join(", ")
+                        "Template {unit}: restarting active instances: {}",
+                        restarting.join(", ")
                     )
                 });
-                plan.activating.insert(unit.clone());
             }
-            plan.to_restart.extend(instances);
             continue;
         }
 
-        if active.is_active(unit, cfg) {
-            // Always restart a running unit whose file changed.
-            plan.to_restart.push(unit.clone());
-            plan.activating.insert(unit.clone());
-            continue;
-        }
-
-        // Inactive: start only if boot would — i.e. some unit that would
-        // itself start this one (wants, requires, binds to, or upholds it) is
-        // active. `[Install]` links show up here as active targets (e.g.
-        // default.target); a unit nothing depends on, or one whose dependants
-        // are stopped, stays stopped.
-        let deps = systemd.reverse_deps(unit, cfg);
-        if deps.iter().any(|dep| active.is_active(dep, cfg)) {
-            plan.to_start.push(unit.clone());
-            plan.activating.insert(unit.clone());
-        } else {
-            skipped.push((unit.clone(), deps));
-        }
+        plan_unit(
+            systemd,
+            unit,
+            &templates,
+            &mut plan,
+            &mut active,
+            &mut skipped,
+            cfg,
+        );
     }
 
-    mark_transitively_activated(&mut plan, &mut skipped, cfg);
+    mark_transitively_activated(&mut plan, &mut skipped, &templates, cfg);
 
     for (unit, deps) in &skipped {
         plan.note(cfg, || {
@@ -214,6 +226,69 @@ pub(crate) fn plan_activation(
     }
 
     plan
+}
+
+/// What [`plan_unit`] decided for a single unit.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// Active unit: restart it into the new configuration.
+    Restart,
+    /// Inactive unit some active unit wants or requires: start it.
+    Start,
+    /// Left alone — nothing active wants it, so boot would not start it
+    /// either.
+    Skip,
+}
+
+/// Decide what to do with one concrete (non-template) unit and record it on
+/// the plan.
+///
+/// Shared by the changed units themselves and by the instances a changed
+/// template expands to, so both obey the same policy: restart what is
+/// running, start what an active unit wants, leave everything else — stopped
+/// by an operator, or failed with nothing depending on it — alone.
+fn plan_unit(
+    systemd: &dyn SystemdTrait,
+    unit: &str,
+    templates: &HashMap<String, String>,
+    plan: &mut ActivationPlan,
+    active: &mut ActiveStates,
+    skipped: &mut Vec<(String, Vec<String>)>,
+    cfg: &Config,
+) -> Action {
+    if active.is_active(unit, cfg) {
+        // Always restart a running unit whose file changed.
+        plan.to_restart.push(unit.to_string());
+        mark_activating(plan, templates, unit);
+        return Action::Restart;
+    }
+
+    // Inactive: start only if boot would — i.e. some unit that would itself
+    // start this one (wants, requires, binds to, or upholds it) is active.
+    // `[Install]` links show up here as active targets (e.g. default.target);
+    // a unit nothing depends on, or one whose dependants are stopped, stays
+    // stopped.
+    let deps = systemd.reverse_deps(unit, cfg);
+    if deps.iter().any(|dep| active.is_active(dep, cfg)) {
+        plan.to_start.push(unit.to_string());
+        mark_activating(plan, templates, unit);
+        Action::Start
+    } else {
+        skipped.push((unit.to_string(), deps));
+        Action::Skip
+    }
+}
+
+/// Record that `unit` will be running once the plan is executed.
+///
+/// Template instances are also recorded under the un-instantiated template
+/// name (`myapp@.service`), because that is what `activates_file` derives from
+/// the changed file — one file, one entry, however many instances it has.
+fn mark_activating(plan: &mut ActivationPlan, templates: &HashMap<String, String>, unit: &str) {
+    plan.activating.insert(unit.to_string());
+    if let Some(template) = templates.get(unit) {
+        plan.activating.insert(template.clone());
+    }
 }
 
 /// Memoised `is_active` lookups for one planning pass.
@@ -261,11 +336,13 @@ impl<'a> ActiveStates<'a> {
 fn mark_transitively_activated(
     plan: &mut ActivationPlan,
     skipped: &mut Vec<(String, Vec<String>)>,
+    templates: &HashMap<String, String>,
     cfg: &Config,
 ) {
-    // Both action lists seed this. `to_restart` matters because template
-    // instances are collected from `list-units --all` with no active check,
-    // so restarting one can start a stopped instance.
+    // Both action lists seed this. `to_restart` matters because a restart
+    // enqueues the unit's `Wants=`/`Requires=` just like a start does, so
+    // restarting an already-running unit still brings up a stopped dependency
+    // of it.
     let mut pending: Vec<String> = plan
         .to_start
         .iter()
@@ -281,7 +358,7 @@ fn mark_transitively_activated(
                 plan.note(cfg, || {
                     format!("{unit}: started by systemd as a dependency of {activated}")
                 });
-                plan.activating.insert(unit.clone());
+                mark_activating(plan, templates, &unit);
                 pending.push(unit);
             } else {
                 i += 1;
@@ -383,7 +460,9 @@ pub(crate) fn activate_changed_units_inner(
 /// unit file, `systemctl stop` cannot reach the running container/process and
 /// it becomes orphaned.
 ///
-/// - **Templates** (`foo@.service`): every running instance is stopped.
+/// - **Templates** (`foo@.service`): every loaded instance is stopped.
+///   `systemctl stop` on an already-inactive instance is a no-op, and passing
+///   it along makes sure nothing half-running survives the file's removal.
 /// - **Regular units**: stopped only if currently active.
 pub(crate) fn stop_deleted_units_inner(
     systemd: &dyn SystemdTrait,
@@ -411,7 +490,7 @@ pub(crate) fn stop_deleted_units_inner(
                 if instances.is_empty() {
                     let _ = writeln!(
                         cfg.output.err(),
-                        "[quadcd] Template {unit}: no running instances to stop"
+                        "[quadcd] Template {unit}: no loaded instances to stop"
                     );
                 } else {
                     let _ = writeln!(
@@ -795,9 +874,37 @@ mod tests {
 
     #[test]
     fn plan_activates_dependency_of_a_restarted_template_instance() {
-        // `list-units --all` also reports loaded-but-stopped instances, so a
-        // restart here can start the instance and drag in the image unit it
-        // requires.
+        // Restarting the running instance re-enqueues its `Requires=`, so the
+        // image unit it depends on comes up with it and has to be pre-pulled.
+        let systemd = MockSystemd::new();
+        systemd.listed_units.borrow_mut().insert(
+            "myapp@*.service".to_string(),
+            vec!["myapp@1.service".to_string()],
+        );
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("myapp@1.service".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "myapp-image.service".to_string(),
+            vec!["myapp@1.service".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &["myapp@.container".into(), "myapp.image".into()],
+            &cfg,
+        );
+
+        assert!(plan.activates_file("myapp.image"));
+        assert!(plan.activates_file("myapp@.container"));
+    }
+
+    #[test]
+    fn plan_does_not_activate_dependency_of_a_stopped_template_instance() {
+        // The only instance is stopped and nothing active wants it, so
+        // neither it nor the image unit it requires will run.
         let systemd = MockSystemd::new();
         systemd.listed_units.borrow_mut().insert(
             "myapp@*.service".to_string(),
@@ -815,7 +922,12 @@ mod tests {
             &cfg,
         );
 
-        assert!(plan.activates_file("myapp.image"));
+        assert!(!plan.activates_file("myapp@.container"));
+        assert!(!plan.activates_file("myapp.image"));
+
+        execute_activation(&systemd, &plan, &cfg);
+        assert!(systemd.restarted.borrow().is_empty());
+        assert!(systemd.started.borrow().is_empty());
     }
 
     #[test]
@@ -914,16 +1026,142 @@ mod tests {
             "myapp@*.service".to_string(),
             vec!["myapp@1.service".to_string()],
         );
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("myapp@1.service".to_string());
+        // `stopped@1.service` is loaded but inactive: `list-units --all`
+        // reports it, and sync must not treat it as something to activate.
+        systemd.listed_units.borrow_mut().insert(
+            "stopped@*.service".to_string(),
+            vec!["stopped@1.service".to_string()],
+        );
         let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
 
         let plan = plan_activation(
             &systemd,
-            &["myapp@.container".into(), "other@.container".into()],
+            &[
+                "myapp@.container".into(),
+                "other@.container".into(),
+                "stopped@.container".into(),
+            ],
             &cfg,
         );
 
         assert!(plan.activates_file("myapp@.container"));
         assert!(!plan.activates_file("other@.container"));
+        assert!(!plan.activates_file("stopped@.container"));
+    }
+
+    #[test]
+    fn plan_template_starts_stopped_instance_wanted_by_active_unit() {
+        // A stopped instance an active unit wants is what boot would bring
+        // up, so sync starts it — and the template file counts as activated
+        // for pre-pull.
+        let systemd = MockSystemd::new();
+        systemd.listed_units.borrow_mut().insert(
+            "myapp@*.service".to_string(),
+            vec!["myapp@1.service".to_string()],
+        );
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "myapp@1.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["myapp@.container".into()], &cfg);
+        assert!(plan.activates_file("myapp@.container"));
+
+        execute_activation(&systemd, &plan, &cfg);
+        assert_eq!(systemd.started.borrow().as_slice(), &["myapp@1.service"]);
+        assert!(systemd.restarted.borrow().is_empty());
+    }
+
+    #[test]
+    fn plan_template_leaves_failed_instance_alone_unless_wanted() {
+        // A failed instance is inactive as far as `is-active` is concerned,
+        // so it follows the same rule as any other stopped unit: restarted
+        // into the fixed configuration only when something active wants it.
+        let systemd = MockSystemd::new();
+        systemd.listed_units.borrow_mut().insert(
+            "myapp@*.service".to_string(),
+            vec!["myapp@boom.service".to_string()],
+        );
+        // A failed unit is listed by `list-units --all` but `is-active`
+        // reports false for it, so it is absent from `active_set`.
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["myapp@.container".into()], &cfg);
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert!(!plan.activates_file("myapp@.container"));
+        assert!(systemd.started.borrow().is_empty());
+        assert!(systemd.restarted.borrow().is_empty());
+
+        // Same instance, now wanted by an active target: it is started.
+        let systemd = MockSystemd::new();
+        systemd.listed_units.borrow_mut().insert(
+            "myapp@*.service".to_string(),
+            vec!["myapp@boom.service".to_string()],
+        );
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "myapp@boom.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
+
+        let plan = plan_activation(&systemd, &["myapp@.container".into()], &cfg);
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert!(plan.activates_file("myapp@.container"));
+        assert_eq!(systemd.started.borrow().as_slice(), &["myapp@boom.service"]);
+    }
+
+    #[test]
+    fn plan_activates_template_file_for_transitively_started_instance() {
+        // `myapp@1.service` is stopped and only wanted by `web.service`,
+        // itself stopped but wanted by an active `default.target`. Sync
+        // starts `web.service`, systemd drags the instance in with it, so the
+        // template file's image still has to be pre-pulled.
+        let systemd = MockSystemd::new();
+        systemd.listed_units.borrow_mut().insert(
+            "myapp@*.service".to_string(),
+            vec!["myapp@1.service".to_string()],
+        );
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "myapp@1.service".to_string(),
+            vec!["web.service".to_string()],
+        );
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "web.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &["myapp@.container".into(), "web.container".into()],
+            &cfg,
+        );
+
+        assert!(plan.activates_file("myapp@.container"));
+        assert!(plan.activates_file("web.container"));
+
+        // Only the changed unit is named; systemd starts the instance.
+        execute_activation(&systemd, &plan, &cfg);
+        assert_eq!(systemd.started.borrow().as_slice(), &["web.service"]);
+        assert!(systemd.restarted.borrow().is_empty());
     }
 
     #[test]
@@ -1002,15 +1240,22 @@ mod tests {
     }
 
     #[test]
-    fn activate_template_restarts_instances() {
+    fn activate_template_restarts_running_instances_only() {
         let systemd = MockSystemd::new();
         systemd.listed_units.borrow_mut().insert(
             "myapp@*.service".to_string(),
             vec![
                 "myapp@web.service".to_string(),
                 "myapp@worker.service".to_string(),
+                // Loaded but stopped — reported because `list-units` runs
+                // with `--all`. An operator stopped it by hand; sync must
+                // leave it alone.
+                "myapp@batch.service".to_string(),
             ],
         );
+        for unit in &["myapp@web.service", "myapp@worker.service"] {
+            systemd.active_set.borrow_mut().insert(unit.to_string());
+        }
         let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
 
         activate_changed_units_inner(&systemd, &["myapp@.container".into()], &cfg);
@@ -1018,6 +1263,47 @@ mod tests {
         let restarted = systemd.restarted.borrow();
         assert!(restarted.contains(&"myapp@web.service".to_string()));
         assert!(restarted.contains(&"myapp@worker.service".to_string()));
+        assert!(
+            !restarted.contains(&"myapp@batch.service".to_string()),
+            "stopped instance must not be restarted: {restarted:?}"
+        );
+        assert!(
+            systemd.started.borrow().is_empty(),
+            "nothing wants the stopped instance, so it must not be started"
+        );
+    }
+
+    #[test]
+    fn activate_template_verbose_logs_skipped_instance() {
+        let systemd = MockSystemd::new();
+        systemd.listed_units.borrow_mut().insert(
+            "myapp@*.service".to_string(),
+            vec![
+                "myapp@web.service".to_string(),
+                "myapp@batch.service".to_string(),
+            ],
+        );
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("myapp@web.service".to_string());
+        let err_buf = crate::output::tests::TestWriter::new();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
+        cfg.verbose = true;
+
+        activate_changed_units_inner(&systemd, &["myapp@.container".into()], &cfg);
+
+        let stderr = err_buf.captured();
+        assert!(
+            stderr.contains(
+                "Template myapp@.service: restarting active instances: myapp@web.service"
+            ),
+            "expected template restart log in: {stderr}"
+        );
+        assert!(
+            stderr.contains("Skipping inactive myapp@batch.service"),
+            "expected skip log in: {stderr}"
+        );
     }
 
     #[test]

@@ -237,6 +237,27 @@ pub fn was_unit_started(unit: &str) -> bool {
     !stdout.trim().ends_with('=')
 }
 
+/// Read `ActiveEnterTimestampMonotonic` for a unit, empty when it has never
+/// become active. A restart gives the unit a new value, so comparing this
+/// before and after a sync shows whether the unit was actually restarted.
+pub fn active_enter_timestamp(unit: &str) -> String {
+    let mut cmd = Command::new("systemctl");
+    if is_user_mode() {
+        cmd.arg("--user");
+    }
+    let output = cmd
+        .args([
+            "show",
+            "-p",
+            "ActiveEnterTimestampMonotonic",
+            "--value",
+            unit,
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 pub fn wait_for_unit_start(unit: &str, timeout: Duration) {
     let desc = format!("{unit} to have been started");
     wait_until(timeout, &desc, || was_unit_started(unit));
