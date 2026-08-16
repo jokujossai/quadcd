@@ -142,3 +142,67 @@ fn service_pre_pulls_container_image() {
         .unwrap();
     assert!(status.success(), "image should exist locally");
 }
+
+/// A container without `[Install]` is never started by sync (nothing wants
+/// it), so its image must not be pre-pulled either — otherwise every sync
+/// downloads an image nothing is about to run.
+#[test]
+#[ignore]
+fn sync_skips_pre_pull_for_unit_that_stays_stopped() {
+    let _ctx = SyncTestContext::new();
+
+    let image = "quay.io/podman/hello:latest";
+
+    // Ensure the image is not cached from a prior run
+    let _ = Command::new("podman").args(["rmi", "-f", image]).status();
+
+    // No [Install] section: nothing wants this unit, so sync must leave it
+    // stopped.
+    let bare = create_bare_repo(
+        "noinstall",
+        &[(
+            "idle.container",
+            &format!("[Container]\nImage={image}\nExec=/bin/true\n"),
+        )],
+    );
+
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.noinstall]\nurl = \"{}\"\ninterval = \"60s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    // One-shot sync so the whole reload/pull/activate cycle has finished by
+    // the time the assertions run.
+    let mut args: Vec<&str> = vec!["sync", "-v"];
+    if is_user_mode() {
+        args.push("--user");
+    }
+    let output = run_quadcd(&args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "quadcd sync should succeed, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Skipping image pre-pull for units that will not be activated"),
+        "sync should report the skipped pre-pull, stderr: {stderr}"
+    );
+
+    assert!(
+        !systemctl(&["is-active", "--quiet", "idle.service"]),
+        "idle.service should not have been started"
+    );
+    let exists = Command::new("podman")
+        .args(["image", "exists", image])
+        .status()
+        .unwrap()
+        .success();
+    assert!(
+        !exists,
+        "image should not be pre-pulled for a unit that stays stopped"
+    );
+}

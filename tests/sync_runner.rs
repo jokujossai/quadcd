@@ -112,6 +112,14 @@ fn run_once_pre_pulls_changed_container_images() {
 
     let vcs = MockVcs::new();
     let systemd = MockSystemd::new();
+    systemd.reverse_deps_map.borrow_mut().insert(
+        "app.service".to_string(),
+        vec!["default.target".to_string()],
+    );
+    systemd
+        .active_set
+        .borrow_mut()
+        .insert("default.target".to_string());
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");
@@ -141,6 +149,130 @@ fn run_once_pre_pulls_changed_container_images() {
 
     let pulled = image_puller.pulled.borrow();
     assert_eq!(pulled.as_slice(), &["quay.io/podman/hello:latest"]);
+}
+
+#[test]
+fn run_once_skips_pre_pull_for_units_that_stay_stopped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = TestWriter::new();
+    let err = TestWriter::new();
+    let mut cfg = test_config(&out, &err);
+    cfg.data_dir = tmp.path().to_path_buf();
+    cfg.verbose = true;
+
+    let vcs = MockVcs::new();
+    // `app.service` is active, so it is restarted and its image is pulled.
+    // `idle.service` is inactive and wanted only by an inactive unit, so it
+    // stays stopped — pulling its image would waste network and disk.
+    let systemd = MockSystemd::new();
+    systemd
+        .active_set
+        .borrow_mut()
+        .insert("app.service".to_string());
+    systemd.reverse_deps_map.borrow_mut().insert(
+        "idle.service".to_string(),
+        vec!["stopped.target".to_string()],
+    );
+    let image_puller = MockImagePuller::new();
+
+    let repo_dir = tmp.path().join("myrepo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    fs::write(
+        repo_dir.join("app.container"),
+        "[Container]\nImage=quay.io/podman/hello:latest\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.join("idle.container"),
+        "[Container]\nImage=quay.io/podman/idle:latest\n",
+    )
+    .unwrap();
+
+    let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
+
+    let mut repos = HashMap::new();
+    repos.insert(
+        "myrepo".to_string(),
+        RepoConfig {
+            url: "https://example.com/repo.git".to_string(),
+            branch: None,
+            interval: None,
+        },
+    );
+    let cd_config = CDConfig {
+        repositories: repos,
+    };
+
+    runner.run_once(&cd_config);
+
+    let pulled = image_puller.pulled.borrow();
+    assert_eq!(
+        pulled.as_slice(),
+        &["quay.io/podman/hello:latest"],
+        "only the restarted unit's image should be pulled"
+    );
+    assert!(
+        systemd.started.borrow().is_empty(),
+        "the inactive unit should not be started"
+    );
+
+    let stderr = err.captured();
+    assert!(
+        stderr.contains(
+            "Skipping image pre-pull for units that will not be activated: idle.container"
+        ),
+        "skipped pre-pull should be logged in verbose mode, got: {stderr}"
+    );
+}
+
+#[test]
+fn run_once_pulls_nothing_when_no_unit_is_activated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = TestWriter::new();
+    let err = TestWriter::new();
+    let mut cfg = test_config(&out, &err);
+    cfg.data_dir = tmp.path().to_path_buf();
+
+    let vcs = MockVcs::new();
+    // Nothing is active and nothing wants the unit: no start, no restart.
+    let systemd = MockSystemd::new();
+    let image_puller = MockImagePuller::new();
+
+    let repo_dir = tmp.path().join("myrepo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    fs::write(
+        repo_dir.join("app.container"),
+        "[Container]\nImage=quay.io/podman/hello:latest\n",
+    )
+    .unwrap();
+
+    let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
+
+    let mut repos = HashMap::new();
+    repos.insert(
+        "myrepo".to_string(),
+        RepoConfig {
+            url: "https://example.com/repo.git".to_string(),
+            branch: None,
+            interval: None,
+        },
+    );
+    let cd_config = CDConfig {
+        repositories: repos,
+    };
+
+    runner.run_once(&cd_config);
+
+    assert!(
+        *systemd.reload_called.borrow(),
+        "daemon-reload still runs so systemd sees the new file"
+    );
+    assert!(
+        image_puller.pulled.borrow().is_empty(),
+        "no image should be pulled when nothing is activated"
+    );
+    assert!(systemd.started.borrow().is_empty());
+    assert!(systemd.restarted.borrow().is_empty());
 }
 
 #[test]

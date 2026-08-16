@@ -17,7 +17,9 @@ use crate::install;
 use super::image::{dedup_images, extract_images, ImagePuller, ImageRef};
 use super::repo::{safe_repo_dir, sync_repo_inner, SyncResult, SyncStatus};
 use super::systemd::SystemdTrait;
-use super::units::{activate_changed_units_inner, all_unit_files, stop_deleted_units_inner};
+use super::units::{
+    all_unit_files, execute_activation, plan_activation, stop_deleted_units_inner, ActivationPlan,
+};
 use super::vcs::{UnitChanges, Vcs};
 
 #[derive(Default)]
@@ -144,13 +146,34 @@ impl<'a> SyncRunner<'a> {
     /// Reads `Image=` lines from the source files in each repo directory,
     /// applies variable substitution, and pulls each unique image so that
     /// restarts don't incur image download time.
-    pub(crate) fn pre_pull_images(&self, changed_files: &[String]) {
+    ///
+    /// Files whose unit `plan` will not start or restart are skipped: pulling
+    /// for a unit that stays stopped costs network and disk for an image
+    /// nothing is about to run.
+    pub(crate) fn pre_pull_images(&self, changed_files: &[String], plan: &ActivationPlan) {
+        let (to_pull, skipped): (Vec<String>, Vec<String>) = changed_files
+            .iter()
+            .cloned()
+            .partition(|f| plan.activates_file(f));
+
+        if self.cfg.verbose && !skipped.is_empty() {
+            let _ = writeln!(
+                self.cfg.output.err(),
+                "[quadcd] Skipping image pre-pull for units that will not be activated: {}",
+                skipped.join(", ")
+            );
+        }
+
+        if to_pull.is_empty() {
+            return;
+        }
+
         let source_dirs = self.cfg.effective_source_dirs();
         let mut all_images: Vec<ImageRef> = Vec::new();
 
         for (source_dir, env_vars) in &source_dirs {
             all_images.extend(extract_images(
-                changed_files,
+                &to_pull,
                 source_dir,
                 env_vars,
                 self.cfg.verbose,
@@ -165,10 +188,16 @@ impl<'a> SyncRunner<'a> {
         }
     }
 
-    /// Restart changed units using `self.systemd`. Returns the list of units
-    /// that failed to reach an active/activating state after restart.
-    pub(crate) fn restart_changed_units(&self, changed_files: &[String]) -> Vec<String> {
-        activate_changed_units_inner(self.systemd, changed_files, self.cfg)
+    /// Decide how the changed units should be activated. Must run after
+    /// `daemon-reload` so systemd reports the updated unit files.
+    pub(crate) fn plan_activation(&self, changed_files: &[String]) -> ActivationPlan {
+        plan_activation(self.systemd, changed_files, self.cfg)
+    }
+
+    /// Start or restart the planned units using `self.systemd`. Returns the
+    /// list of units that failed to reach an active/activating state.
+    pub(crate) fn execute_activation(&self, plan: &ActivationPlan) -> Vec<String> {
+        execute_activation(self.systemd, plan, self.cfg)
     }
 
     /// Stop units whose backing files were deleted by the sync.
@@ -260,8 +289,9 @@ impl<'a> SyncRunner<'a> {
     ///
     /// Order matters: deleted units must be stopped **before** `daemon-reload`
     /// so systemd can still locate them; otherwise the underlying containers
-    /// or processes become orphaned. After the reload, images for changed
-    /// units are pre-pulled and the changed units are started or restarted.
+    /// or processes become orphaned. After the reload, the activation plan is
+    /// computed, images for the units it will activate are pre-pulled, and the
+    /// plan is executed.
     ///
     /// No-op when `changes` is empty. In sync-only mode, logs the changes but
     /// skips all systemd interaction.
@@ -288,8 +318,9 @@ impl<'a> SyncRunner<'a> {
         }
         self.stop_deleted_units(&changes.deleted);
         self.systemd.daemon_reload(self.cfg);
-        self.pre_pull_images(&changes.changed);
-        let _failed = self.restart_changed_units(&changes.changed);
+        let plan = self.plan_activation(&changes.changed);
+        self.pre_pull_images(&changes.changed, &plan);
+        let _failed = self.execute_activation(&plan);
     }
 
     /// One-shot sync: sync all repos, daemon-reload, then restart changed units.

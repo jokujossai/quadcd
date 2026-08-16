@@ -56,9 +56,38 @@ pub(crate) fn is_template_unit(unit_name: &str) -> bool {
         .is_some_and(|s| s.ends_with('@'))
 }
 
-/// Activate changed units using smart start/restart logic.
+/// What sync intends to do with a set of changed units.
 ///
-/// After `daemon-reload`, each changed unit is inspected:
+/// Produced by [`plan_activation`] and carried out by [`execute_activation`].
+/// The decision is split from the execution so callers can act on it before
+/// anything is started — sync uses it to pre-pull images only for the units it
+/// is actually going to activate.
+#[derive(Debug, Default)]
+pub(crate) struct ActivationPlan {
+    /// Inactive units to `systemctl start`.
+    to_start: Vec<String>,
+    /// Active units — and running instances of changed templates — to
+    /// `systemctl restart`.
+    to_restart: Vec<String>,
+    /// Unit names as derived from the changed files, restricted to the ones
+    /// this plan acts on. Templates appear un-instantiated (`foo@.service`)
+    /// so a changed file always maps back to a single entry.
+    activating: Vec<String>,
+}
+
+impl ActivationPlan {
+    /// Return `true` if the unit backing `filename` will be started or
+    /// restarted by this plan.
+    pub(crate) fn activates_file(&self, filename: &str) -> bool {
+        let unit = unit_name_for_restart(filename);
+        self.activating.contains(&unit)
+    }
+}
+
+/// Decide how each changed unit should be activated.
+///
+/// Must run **after** `daemon-reload` so the systemd queries below see the
+/// updated unit files. Each changed unit is inspected:
 /// - **Templates** (`foo@.service`): discover running instances via
 ///   `list-units` and restart them.
 /// - **Active** units: `restart` — a running unit whose file changed keeps
@@ -70,14 +99,11 @@ pub(crate) fn is_template_unit(unit_name: &str) -> bool {
 ///   `default.target`, materialised from `[Install]`). Anything else —
 ///   including units an operator stopped by hand — is left alone, so sync
 ///   never creates a running state that a reboot would not reproduce.
-///
-/// Returns the list of units whose post-activation `ActiveState` is anything
-/// other than `active`/`activating` (i.e. failed to come up).
-pub(crate) fn activate_changed_units_inner(
+pub(crate) fn plan_activation(
     systemd: &dyn SystemdTrait,
     changed_files: &[String],
     cfg: &Config,
-) -> Vec<String> {
+) -> ActivationPlan {
     let mut units: Vec<String> = changed_files
         .iter()
         .map(|f| unit_name_for_restart(f))
@@ -85,12 +111,7 @@ pub(crate) fn activate_changed_units_inner(
     units.sort();
     units.dedup();
 
-    if units.is_empty() {
-        return Vec::new();
-    }
-
-    let mut to_start: Vec<String> = Vec::new();
-    let mut to_restart: Vec<String> = Vec::new();
+    let mut plan = ActivationPlan::default();
 
     for unit in &units {
         if is_template_unit(unit) {
@@ -111,13 +132,17 @@ pub(crate) fn activate_changed_units_inner(
                     );
                 }
             }
-            to_restart.extend(instances);
+            if !instances.is_empty() {
+                plan.activating.push(unit.clone());
+            }
+            plan.to_restart.extend(instances);
             continue;
         }
 
         if systemd.is_active(unit, cfg) {
             // Always restart a running unit whose file changed.
-            to_restart.push(unit.clone());
+            plan.to_restart.push(unit.clone());
+            plan.activating.push(unit.clone());
             continue;
         }
 
@@ -127,7 +152,8 @@ pub(crate) fn activate_changed_units_inner(
         // depends on, or one whose dependants are stopped, stays stopped.
         let deps = systemd.reverse_deps(unit, cfg);
         if deps.iter().any(|dep| systemd.is_active(dep, cfg)) {
-            to_start.push(unit.clone());
+            plan.to_start.push(unit.clone());
+            plan.activating.push(unit.clone());
         } else if cfg.verbose {
             let _ = writeln!(
                 cfg.output.err(),
@@ -136,6 +162,24 @@ pub(crate) fn activate_changed_units_inner(
             );
         }
     }
+
+    plan
+}
+
+/// Carry out an [`ActivationPlan`] and report which units failed to come up.
+///
+/// Returns the list of units whose post-activation `ActiveState` is anything
+/// other than `active`/`activating` (i.e. failed to come up).
+pub(crate) fn execute_activation(
+    systemd: &dyn SystemdTrait,
+    plan: &ActivationPlan,
+    cfg: &Config,
+) -> Vec<String> {
+    let ActivationPlan {
+        to_start,
+        to_restart,
+        ..
+    } = plan;
 
     if cfg.verbose {
         if !to_start.is_empty() {
@@ -155,10 +199,10 @@ pub(crate) fn activate_changed_units_inner(
     }
 
     if !to_start.is_empty() {
-        systemd.start(&to_start, cfg);
+        systemd.start(to_start, cfg);
     }
     if !to_restart.is_empty() {
-        systemd.restart(&to_restart, cfg);
+        systemd.restart(to_restart, cfg);
     }
 
     let mut activated: Vec<String> = to_start.iter().chain(to_restart.iter()).cloned().collect();
@@ -189,6 +233,20 @@ pub(crate) fn activate_changed_units_inner(
     }
 
     failed
+}
+
+/// Plan and immediately execute activation for `changed_files`.
+///
+/// Convenience wrapper around [`plan_activation`] + [`execute_activation`] for
+/// callers that do not need to inspect the plan in between.
+#[cfg(test)]
+pub(crate) fn activate_changed_units_inner(
+    systemd: &dyn SystemdTrait,
+    changed_files: &[String],
+    cfg: &Config,
+) -> Vec<String> {
+    let plan = plan_activation(systemd, changed_files, cfg);
+    execute_activation(systemd, &plan, cfg)
 }
 
 /// Stop units whose backing files were deleted from the repo.
@@ -471,6 +529,119 @@ mod tests {
             }
             _ => panic!("unknown expected action: {expected}"),
         }
+    }
+
+    // plan_activation / ActivationPlan::activates_file
+
+    #[rstest]
+    #[case::started_unit_is_activated(&["default.target"], &["default.target"], false, true)]
+    #[case::restarted_unit_is_activated(&[], &[], true, true)]
+    #[case::skipped_inactive_unit_is_not_activated(&["consumer.service"], &[], false, false)]
+    #[case::unit_without_deps_is_not_activated(&[], &[], false, false)]
+    fn plan_activates_file_matches_planned_action(
+        #[case] reverse_deps: &[&str],
+        #[case] active_deps: &[&str],
+        #[case] is_active: bool,
+        #[case] expected: bool,
+    ) {
+        let systemd = MockSystemd::new();
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            reverse_deps.iter().map(|s| s.to_string()).collect(),
+        );
+        for dep in active_deps {
+            systemd.active_set.borrow_mut().insert(dep.to_string());
+        }
+        if is_active {
+            systemd
+                .active_set
+                .borrow_mut()
+                .insert("app.service".to_string());
+        }
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
+
+        assert_eq!(plan.activates_file("app.container"), expected);
+        // Nothing was executed by planning alone.
+        assert!(systemd.started.borrow().is_empty());
+        assert!(systemd.restarted.borrow().is_empty());
+    }
+
+    #[test]
+    fn plan_activates_template_file_only_with_running_instances() {
+        let systemd = MockSystemd::new();
+        systemd.listed_units.borrow_mut().insert(
+            "myapp@*.service".to_string(),
+            vec!["myapp@1.service".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &["myapp@.container".into(), "other@.container".into()],
+            &cfg,
+        );
+
+        assert!(plan.activates_file("myapp@.container"));
+        assert!(!plan.activates_file("other@.container"));
+    }
+
+    #[test]
+    fn plan_does_not_activate_unchanged_file() {
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
+
+        assert!(plan.activates_file("app.container"));
+        assert!(!plan.activates_file("other.container"));
+    }
+
+    #[test]
+    fn plan_maps_nested_path_to_same_unit() {
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["nested/app.container".into()], &cfg);
+
+        assert!(plan.activates_file("nested/app.container"));
+    }
+
+    #[test]
+    fn execute_activation_runs_planned_units() {
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("web.service".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &["app.container".into(), "web.service".into()],
+            &cfg,
+        );
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert_eq!(systemd.started.borrow().as_slice(), &["app.service"]);
+        assert_eq!(systemd.restarted.borrow().as_slice(), &["web.service"]);
     }
 
     #[test]

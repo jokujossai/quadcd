@@ -102,6 +102,8 @@ quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i] [-
 
 Sync pulls unit files from configured git repositories into the data directory, then triggers `systemctl daemon-reload` and restarts changed units with `systemctl restart`.
 
+A changed unit is restarted when it is active, and started when it is inactive but some active unit wants or requires it — the same set of units a reboot would bring up. Units that stay stopped are left alone, and their container images are not pre-pulled.
+
 SSH known hosts are stored in the data directory (`.known_hosts` file) to avoid issues with system SSH config under systemd sandboxing. Use `--accept-new-host-keys` for initial setup to automatically accept host keys on first connect, or `-i` for fully interactive SSH (manual host key approval, credential prompts).
 
 ### Version
