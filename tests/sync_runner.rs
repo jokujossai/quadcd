@@ -187,6 +187,9 @@ fn run_once_skips_pre_pull_for_units_that_stay_stopped() {
         "[Container]\nImage=quay.io/podman/idle:latest\n",
     )
     .unwrap();
+    // A stopped unit with no image at all: it must not show up in the
+    // pre-pull skip message, which is about images.
+    fs::write(repo_dir.join("backup.timer"), "[Timer]\nOnCalendar=daily\n").unwrap();
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
@@ -219,9 +222,94 @@ fn run_once_skips_pre_pull_for_units_that_stay_stopped() {
     let stderr = err.captured();
     assert!(
         stderr.contains(
-            "Skipping image pre-pull for units that will not be activated: idle.container"
+            "Skipping image pre-pull for units that will not be activated: idle.container\n"
         ),
         "skipped pre-pull should be logged in verbose mode, got: {stderr}"
+    );
+    let pre_pull_line = stderr
+        .lines()
+        .find(|l| l.contains("Skipping image pre-pull"))
+        .unwrap_or_default();
+    assert!(
+        !pre_pull_line.contains("backup.timer"),
+        "a unit file that never had an image should not be reported as a skipped pre-pull: {pre_pull_line}"
+    );
+    // A pull happened, so the plan was recomputed afterwards — the decisions
+    // must still be reported exactly once.
+    assert_eq!(
+        stderr.matches("Skipping inactive idle.service").count(),
+        1,
+        "re-planning after the pull must not duplicate log lines: {stderr}"
+    );
+}
+
+#[test]
+fn run_once_pre_pulls_image_unit_required_by_a_starting_container() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = TestWriter::new();
+    let err = TestWriter::new();
+    let mut cfg = test_config(&out, &err);
+    cfg.data_dir = tmp.path().to_path_buf();
+
+    let vcs = MockVcs::new();
+    // `web.service` is inactive but wanted by an active `default.target`, so
+    // sync starts it. `web-image.service` is only required by `web.service`;
+    // systemd starts it as part of that transaction, so its image still has
+    // to be pre-pulled.
+    let systemd = MockSystemd::new();
+    systemd
+        .active_set
+        .borrow_mut()
+        .insert("default.target".to_string());
+    systemd.reverse_deps_map.borrow_mut().insert(
+        "web.service".to_string(),
+        vec!["default.target".to_string()],
+    );
+    systemd.reverse_deps_map.borrow_mut().insert(
+        "web-image.service".to_string(),
+        vec!["web.service".to_string()],
+    );
+    let image_puller = MockImagePuller::new();
+
+    let repo_dir = tmp.path().join("myrepo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    fs::write(
+        repo_dir.join("web.container"),
+        "[Container]\nImage=web.image\n",
+    )
+    .unwrap();
+    fs::write(
+        repo_dir.join("web.image"),
+        "[Image]\nImage=quay.io/podman/hello:latest\n",
+    )
+    .unwrap();
+
+    let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
+
+    let mut repos = HashMap::new();
+    repos.insert(
+        "myrepo".to_string(),
+        RepoConfig {
+            url: "https://example.com/repo.git".to_string(),
+            branch: None,
+            interval: None,
+        },
+    );
+    let cd_config = CDConfig {
+        repositories: repos,
+    };
+
+    runner.run_once(&cd_config);
+
+    assert_eq!(
+        image_puller.pulled.borrow().as_slice(),
+        &["quay.io/podman/hello:latest"],
+        "the image unit's image should be pre-pulled for the starting container"
+    );
+    assert_eq!(
+        systemd.started.borrow().as_slice(),
+        &["web.service"],
+        "systemd pulls in the image unit; sync should not start it itself"
     );
 }
 

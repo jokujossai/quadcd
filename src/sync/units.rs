@@ -70,14 +70,21 @@ pub(crate) struct ActivationPlan {
     /// `systemctl restart`.
     to_restart: Vec<String>,
     /// Unit names as derived from the changed files, restricted to the ones
-    /// this plan acts on. Templates appear un-instantiated (`foo@.service`)
-    /// so a changed file always maps back to a single entry.
+    /// that will end up running: those started or restarted directly, plus
+    /// those systemd pulls in as a dependency of a unit being started.
+    /// Templates appear un-instantiated (`foo@.service`) so a changed file
+    /// always maps back to a single entry.
     activating: Vec<String>,
+    /// Verbose lines describing the decisions, emitted by
+    /// [`execute_activation`] rather than at planning time so a plan can be
+    /// computed without logging (sync plans twice around a slow image pull).
+    notes: Vec<String>,
 }
 
 impl ActivationPlan {
-    /// Return `true` if the unit backing `filename` will be started or
-    /// restarted by this plan.
+    /// Return `true` if the unit backing `filename` will be running after
+    /// this plan is executed — started, restarted, or pulled in by systemd
+    /// as a dependency of a unit being started.
     pub(crate) fn activates_file(&self, filename: &str) -> bool {
         let unit = unit_name_for_restart(filename);
         self.activating.contains(&unit)
@@ -99,6 +106,10 @@ impl ActivationPlan {
 ///   `default.target`, materialised from `[Install]`). Anything else —
 ///   including units an operator stopped by hand — is left alone, so sync
 ///   never creates a running state that a reboot would not reproduce.
+///
+/// Planning performs no systemd state changes and logs nothing; the verbose
+/// account of the decisions is stored on the plan and written out by
+/// [`execute_activation`].
 pub(crate) fn plan_activation(
     systemd: &dyn SystemdTrait,
     changed_files: &[String],
@@ -112,27 +123,24 @@ pub(crate) fn plan_activation(
     units.dedup();
 
     let mut plan = ActivationPlan::default();
+    // Units left alone, with the reverse dependencies that failed to justify
+    // starting them. Revisited below: a dependant this plan starts will drag
+    // them in even though sync does not name them itself.
+    let mut skipped: Vec<(String, Vec<String>)> = Vec::new();
 
     for unit in &units {
         if is_template_unit(unit) {
             // Discover running instances for this template
             let pattern = unit.replace("@.", "@*.");
             let instances = systemd.list_units_matching(&pattern, cfg);
-            if cfg.verbose {
-                if instances.is_empty() {
-                    let _ = writeln!(
-                        cfg.output.err(),
-                        "[quadcd] Template {unit}: no running instances found"
-                    );
-                } else {
-                    let _ = writeln!(
-                        cfg.output.err(),
-                        "[quadcd] Template {unit}: restarting instances: {}",
-                        instances.join(", ")
-                    );
-                }
-            }
-            if !instances.is_empty() {
+            if instances.is_empty() {
+                plan.notes
+                    .push(format!("Template {unit}: no running instances found"));
+            } else {
+                plan.notes.push(format!(
+                    "Template {unit}: restarting instances: {}",
+                    instances.join(", ")
+                ));
                 plan.activating.push(unit.clone());
             }
             plan.to_restart.extend(instances);
@@ -154,16 +162,52 @@ pub(crate) fn plan_activation(
         if deps.iter().any(|dep| systemd.is_active(dep, cfg)) {
             plan.to_start.push(unit.clone());
             plan.activating.push(unit.clone());
-        } else if cfg.verbose {
-            let _ = writeln!(
-                cfg.output.err(),
-                "[quadcd] Skipping inactive {unit} (not wanted by any active unit; wanted/required by: [{}])",
-                deps.join(", ")
-            );
+        } else {
+            skipped.push((unit.clone(), deps));
         }
     }
 
+    mark_transitively_activated(&mut plan, &mut skipped);
+
+    for (unit, deps) in &skipped {
+        plan.notes.push(format!(
+            "Skipping inactive {unit} (not wanted by any active unit; wanted/required by: [{}])",
+            deps.join(", ")
+        ));
+    }
+
     plan
+}
+
+/// Move units that systemd will start as a side effect into the plan's
+/// `activating` set.
+///
+/// A skipped unit is not started by sync, but if something sync *is* starting
+/// wants or requires it, systemd brings it up in the same transaction — just
+/// as boot would. `web.image` required by a `web.container` being started is
+/// the common case: its image still has to be pre-pulled, or the download
+/// lands inline during unit start. Iterates to a fixed point so chains
+/// (`a` → `b` → `c`) are covered.
+fn mark_transitively_activated(
+    plan: &mut ActivationPlan,
+    skipped: &mut Vec<(String, Vec<String>)>,
+) {
+    // Only `to_start` seeds this: units in `to_restart` are already active,
+    // so their dependencies were resolved by the `is_active` check above.
+    let mut pending: Vec<String> = plan.to_start.clone();
+
+    while let Some(activated) = pending.pop() {
+        let mut i = 0;
+        while i < skipped.len() {
+            if skipped[i].1.contains(&activated) {
+                let (unit, _) = skipped.remove(i);
+                plan.activating.push(unit.clone());
+                pending.push(unit);
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Carry out an [`ActivationPlan`] and report which units failed to come up.
@@ -178,10 +222,14 @@ pub(crate) fn execute_activation(
     let ActivationPlan {
         to_start,
         to_restart,
+        notes,
         ..
     } = plan;
 
     if cfg.verbose {
+        for note in notes {
+            let _ = writeln!(cfg.output.err(), "[quadcd] {note}");
+        }
         if !to_start.is_empty() {
             let _ = writeln!(
                 cfg.output.err(),
@@ -566,6 +614,131 @@ mod tests {
         // Nothing was executed by planning alone.
         assert!(systemd.started.borrow().is_empty());
         assert!(systemd.restarted.borrow().is_empty());
+    }
+
+    #[test]
+    fn plan_activates_dependency_of_a_started_unit() {
+        // `web.image` is required by `web.service`, which is inactive but
+        // wanted by an active `default.target`. Starting `web.service` pulls
+        // `web-image.service` into the same transaction, so its image has to
+        // be pre-pulled even though sync never names it.
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "web.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "web-image.service".to_string(),
+            vec!["web.service".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &["web.container".into(), "web.image".into()],
+            &cfg,
+        );
+
+        assert!(plan.activates_file("web.container"));
+        assert!(plan.activates_file("web.image"));
+
+        // systemd starts the image unit as a dependency; sync must not name
+        // it itself.
+        execute_activation(&systemd, &plan, &cfg);
+        assert_eq!(systemd.started.borrow().as_slice(), &["web.service"]);
+    }
+
+    #[test]
+    fn plan_activates_transitive_dependency_chain() {
+        // c.service <- b.service <- a.service, with only a.service wanted by
+        // an active target. All three end up running.
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
+        systemd
+            .reverse_deps_map
+            .borrow_mut()
+            .insert("a.service".to_string(), vec!["default.target".to_string()]);
+        systemd
+            .reverse_deps_map
+            .borrow_mut()
+            .insert("b.service".to_string(), vec!["a.service".to_string()]);
+        systemd
+            .reverse_deps_map
+            .borrow_mut()
+            .insert("c.service".to_string(), vec!["b.service".to_string()]);
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &[
+                "c.container".into(),
+                "b.container".into(),
+                "a.container".into(),
+            ],
+            &cfg,
+        );
+
+        assert!(plan.activates_file("a.container"));
+        assert!(plan.activates_file("b.container"));
+        assert!(plan.activates_file("c.container"));
+    }
+
+    #[test]
+    fn plan_does_not_activate_dependency_of_a_skipped_unit() {
+        // Nothing active wants `web.service`, so neither it nor the image
+        // unit it requires will run.
+        let systemd = MockSystemd::new();
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "web.service".to_string(),
+            vec!["stopped.target".to_string()],
+        );
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "web-image.service".to_string(),
+            vec!["web.service".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &["web.container".into(), "web.image".into()],
+            &cfg,
+        );
+
+        assert!(!plan.activates_file("web.container"));
+        assert!(!plan.activates_file("web.image"));
+    }
+
+    #[test]
+    fn plan_logs_nothing_until_executed() {
+        let err_buf = crate::output::tests::TestWriter::new();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(err_buf.clone()));
+        cfg.verbose = true;
+
+        let systemd = MockSystemd::new();
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["stopped.target".to_string()],
+        );
+
+        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
+        assert!(
+            err_buf.captured().is_empty(),
+            "planning must be silent so it can be repeated around a pull"
+        );
+
+        execute_activation(&systemd, &plan, &cfg);
+        assert!(
+            err_buf.captured().contains("Skipping inactive app.service"),
+            "expected skip log in: {}",
+            err_buf.captured()
+        );
     }
 
     #[test]

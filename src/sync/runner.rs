@@ -147,12 +147,15 @@ impl<'a> SyncRunner<'a> {
     /// applies variable substitution, and pulls each unique image so that
     /// restarts don't incur image download time.
     ///
-    /// Files whose unit `plan` will not start or restart are skipped: pulling
-    /// for a unit that stays stopped costs network and disk for an image
-    /// nothing is about to run.
-    pub(crate) fn pre_pull_images(&self, changed_files: &[String], plan: &ActivationPlan) {
+    /// Files whose unit `plan` leaves stopped are skipped: pulling for a unit
+    /// that stays stopped costs network and disk for an image nothing is
+    /// about to run.
+    ///
+    /// Returns `true` if any image was pulled.
+    pub(crate) fn pre_pull_images(&self, changed_files: &[String], plan: &ActivationPlan) -> bool {
         let (to_pull, skipped): (Vec<String>, Vec<String>) = changed_files
             .iter()
+            .filter(|f| f.ends_with(".container") || f.ends_with(".image"))
             .cloned()
             .partition(|f| plan.activates_file(f));
 
@@ -165,7 +168,7 @@ impl<'a> SyncRunner<'a> {
         }
 
         if to_pull.is_empty() {
-            return;
+            return false;
         }
 
         let source_dirs = self.cfg.effective_source_dirs();
@@ -186,6 +189,8 @@ impl<'a> SyncRunner<'a> {
         for image in &all_images {
             self.image_puller.pull(image, self.cfg);
         }
+
+        !all_images.is_empty()
     }
 
     /// Decide how the changed units should be activated. Must run after
@@ -319,7 +324,16 @@ impl<'a> SyncRunner<'a> {
         self.stop_deleted_units(&changes.deleted);
         self.systemd.daemon_reload(self.cfg);
         let plan = self.plan_activation(&changes.changed);
-        self.pre_pull_images(&changes.changed, &plan);
+        // A pull can take minutes, during which an operator may stop or start
+        // something. Re-plan afterwards so the units acted on reflect the
+        // state at that moment, not the state the pre-pull decision was made
+        // on. Planning is read-only and silent, so only the executed plan is
+        // logged.
+        let plan = if self.pre_pull_images(&changes.changed, &plan) {
+            self.plan_activation(&changes.changed)
+        } else {
+            plan
+        };
         let _failed = self.execute_activation(&plan);
     }
 

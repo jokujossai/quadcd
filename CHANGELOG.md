@@ -8,7 +8,7 @@
 
 ### Changed
 
-- Image pre-pull now follows the activation decision: images are pulled only for changed `.container` and `.image` files whose unit sync is about to start or restart. A unit that stays stopped — inactive with no active unit wanting or requiring it — no longer causes a pull of an image nothing is about to run. Verbose runs log the skipped files.
+- Image pre-pull now follows the activation decision: images are pulled only for changed `.container` and `.image` files whose unit will be running after the sync — started or restarted by sync, or pulled in by systemd as a dependency of a unit sync starts (for example an `.image` unit required by a `.container`). A unit that stays stopped — inactive with no active unit wanting or requiring it — no longer causes a pull of an image nothing is about to run. Verbose runs log the skipped files.
 - **Breaking (MSRV):** Minimum Supported Rust Version bumped from 1.70 to 1.74. This matches the toolchain CI builds and tests against, and lets the codebase use `io::Error::other` and other ≥1.74 conveniences. Downstream consumers on Rust 1.70–1.73 will need to upgrade their toolchain.
 
 ## 0.2.0 - 2026-05-23
