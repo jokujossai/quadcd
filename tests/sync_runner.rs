@@ -9,6 +9,22 @@ use quadcd::testing::{MockImagePuller, MockSystemd, MockVcs};
 use std::collections::HashMap;
 use std::fs;
 
+/// A `CDConfig` with the single `myrepo` repository the tests below sync.
+fn single_repo_config() -> CDConfig {
+    let mut repos = HashMap::new();
+    repos.insert(
+        "myrepo".to_string(),
+        RepoConfig {
+            url: "https://example.com/repo.git".to_string(),
+            branch: None,
+            interval: None,
+        },
+    );
+    CDConfig {
+        repositories: repos,
+    }
+}
+
 // ===========================================================================
 // SyncRunner::run_once
 // ===========================================================================
@@ -39,18 +55,7 @@ fn run_once_syncs_and_restarts() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     let failures = runner.run_once(&cd_config);
 
@@ -82,18 +87,7 @@ fn run_once_no_changes_no_restart() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     let failures = runner.run_once(&cd_config);
 
@@ -132,18 +126,7 @@ fn run_once_pre_pulls_changed_container_images() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     runner.run_once(&cd_config);
 
@@ -193,18 +176,7 @@ fn run_once_skips_pre_pull_for_units_that_stay_stopped() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     runner.run_once(&cd_config);
 
@@ -286,18 +258,7 @@ fn run_once_pre_pulls_image_unit_required_by_a_starting_container() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     runner.run_once(&cd_config);
 
@@ -336,18 +297,7 @@ fn run_once_pulls_nothing_when_no_unit_is_activated() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     runner.run_once(&cd_config);
 
@@ -381,18 +331,7 @@ fn run_once_returns_failure_count() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     let failures = runner.run_once(&cd_config);
     assert_eq!(failures, 1);
@@ -429,18 +368,7 @@ fn run_once_sync_only_skips_reload_and_restart() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller).sync_only(true);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     let failures = runner.run_once(&cd_config);
 
@@ -491,18 +419,7 @@ fn sync_all_error_is_logged() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     let result = runner.sync_all(&cd_config);
     assert!(result.changes.is_empty());
@@ -533,18 +450,7 @@ fn sync_all_updated_empty_changed() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     runner.sync_all(&cd_config);
 
@@ -572,18 +478,7 @@ fn sync_all_up_to_date_verbose() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     runner.sync_all(&cd_config);
 
@@ -612,18 +507,7 @@ fn sync_all_updated_with_changes() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     let result = runner.sync_all(&cd_config);
     assert_eq!(result.changes.changed, vec!["app.container"]);
@@ -670,18 +554,7 @@ fn run_once_stops_deleted_units_before_reload() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     let failures = runner.run_once(&cd_config);
 
@@ -736,18 +609,7 @@ fn run_once_sync_only_does_not_stop_deleted() {
 
     let runner = SyncRunner::new(&cfg, &vcs, &systemd, &image_puller).sync_only(true);
 
-    let mut repos = HashMap::new();
-    repos.insert(
-        "myrepo".to_string(),
-        RepoConfig {
-            url: "https://example.com/repo.git".to_string(),
-            branch: None,
-            interval: None,
-        },
-    );
-    let cd_config = CDConfig {
-        repositories: repos,
-    };
+    let cd_config = single_repo_config();
 
     runner.run_once(&cd_config);
 
