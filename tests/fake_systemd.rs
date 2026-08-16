@@ -201,6 +201,70 @@ fn is_active_failure() {
     assert!(!sd.is_active("myapp.service", &cfg));
 }
 
+// reverse_deps
+
+#[test]
+fn reverse_deps_queries_only_start_authorising_properties() {
+    // Without FAKE_STDOUT the fake echoes its argv, so the parsed "deps" are
+    // the systemctl arguments — enough to pin down which properties are asked
+    // for. Property names must match systemd's spelling exactly: `systemctl
+    // show` returns an empty value for an unknown property and exits 0, so a
+    // typo would silently look like "no reverse dependencies".
+    let sd = fake_systemd(0);
+    let cfg = test_cfg(false, false);
+
+    let args = sd.reverse_deps("myapp.service", &cfg);
+
+    for included in ["WantedBy", "RequiredBy", "BoundBy", "UpheldBy"] {
+        assert!(
+            args.contains(&format!("--property={included}")),
+            "{included} should authorise a start; got {args:?}"
+        );
+    }
+    // `PartOf=` propagates stop/restart only, `Requisite=` never starts,
+    // socket/timer activation is on demand, `Conflicts=` stops.
+    for excluded in [
+        "ConsistsOf",
+        "RequisiteOf",
+        "TriggeredBy",
+        "ConflictedBy",
+        "StopPropagatedFrom",
+    ] {
+        assert!(
+            !args.contains(&format!("--property={excluded}")),
+            "{excluded} must not authorise a start; got {args:?}"
+        );
+    }
+}
+
+#[test]
+fn reverse_deps_unions_and_deduplicates_properties() {
+    // One line per property, in systemd's own order: WantedBy, RequiredBy,
+    // BoundBy (empty here), UpheldBy.
+    let sd = fake_systemd_stdout(
+        "multi-user.target default.target\ndefault.target\n\nsupervisor.service",
+        0,
+    );
+    let cfg = test_cfg(false, false);
+
+    assert_eq!(
+        sd.reverse_deps("myapp.service", &cfg),
+        vec![
+            "multi-user.target".to_string(),
+            "default.target".to_string(),
+            "supervisor.service".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn reverse_deps_error_returns_empty() {
+    let sd = Systemd::with_command("/no/such/systemctl-binary");
+    let cfg = test_cfg(false, false);
+
+    assert!(sd.reverse_deps("myapp.service", &cfg).is_empty());
+}
+
 #[test]
 fn list_units_matching_parses_output() {
     let sd = fake_systemd_stdout(

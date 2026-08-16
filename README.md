@@ -102,7 +102,11 @@ quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i] [-
 
 Sync pulls unit files from configured git repositories into the data directory, then triggers `systemctl daemon-reload` and restarts changed units with `systemctl restart`.
 
-A changed unit is restarted when it is active, and started when it is inactive but some active unit lists it in `WantedBy=` or `RequiredBy=` — approximating what a reboot would bring up, so a unit stopped by hand is not resurrected. Units that stay stopped are left alone, and their container images are not pre-pulled. Images are still pre-pulled for units systemd starts as a dependency of a unit sync starts, such as an `.image` unit required by a `.container`.
+A changed unit is restarted when it is active, and started when it is inactive but some active unit would itself start it — that is, an active unit declares `Wants=`, `Requires=`, `BindsTo=` or `Upholds=` on it (seen from the changed unit's side as `WantedBy=`, `RequiredBy=`, `BoundBy=` and `UpheldBy=`). This approximates what a reboot would bring up, so a unit stopped by hand is not resurrected.
+
+Relationships that never make systemd start a unit do not count: `PartOf=` only propagates stop and restart, `Requisite=` checks a unit rather than starting it, and `Conflicts=` stops it. Socket-, timer- and path-activated services are also left alone — the point of `TriggeredBy=` activation is that the service starts on demand, and a reboot leaves it inactive until the trigger fires.
+
+Units that stay stopped are left alone, and their container images are not pre-pulled. Images are still pre-pulled for units systemd starts as a dependency of a unit sync starts, such as an `.image` unit required by a `.container`.
 
 SSH known hosts are stored in the data directory (`.known_hosts` file) to avoid issues with system SSH config under systemd sandboxing. Use `--accept-new-host-keys` for initial setup to automatically accept host keys on first connect, or `-i` for fully interactive SSH (manual host key approval, credential prompts).
 
