@@ -481,3 +481,102 @@ fn service_sync_does_not_start_stopped_generated_unit() {
 
     assert!(is_service_active(), "sync service should still be running");
 }
+
+/// Template analogue of the test above: when a template unit file changes,
+/// sync restarts the instances that are running and leaves a stopped instance
+/// stopped. `systemctl list-units --all` reports loaded-but-inactive
+/// instances too, so expanding a template must not be taken as licence to
+/// start them.
+#[test]
+#[ignore]
+fn service_sync_does_not_start_stopped_template_instance() {
+    let _ctx = SyncTestContext::new();
+
+    // A template without [Install]: instances run only when started by hand.
+    let template = |version: &str| {
+        format!(
+            "[Unit]\nDescription=worker %i {version}\n\n\
+             [Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n"
+        )
+    };
+
+    let bare = create_bare_repo("myapp", &[("worker@.service", template("v1").as_str())]);
+
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.myapp]\nurl = \"{}\"\ninterval = \"2s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    start_sync_service();
+
+    wait_for_file("myapp", "worker@.service", Duration::from_secs(10));
+
+    // Start two instances by hand; nothing else wants them. Retry until the
+    // generator has run and systemd knows the template.
+    wait_until(
+        Duration::from_secs(15),
+        "worker@1.service to be startable",
+        || systemctl(&["start", "worker@1.service"]),
+    );
+    wait_until(
+        Duration::from_secs(15),
+        "worker@2.service to be startable",
+        || systemctl(&["start", "worker@2.service"]),
+    );
+    wait_for_unit_start("worker@1.service", Duration::from_secs(10));
+    wait_for_unit_start("worker@2.service", Duration::from_secs(10));
+
+    // Stop one of them, as an operator would.
+    assert!(
+        systemctl(&["stop", "worker@1.service"]),
+        "failed to stop worker@1.service"
+    );
+    assert!(
+        !systemctl(&["is-active", "--quiet", "worker@1.service"]),
+        "worker@1.service should be inactive after stop"
+    );
+
+    let before = active_enter_timestamp("worker@2.service");
+
+    push_commit(
+        &bare,
+        &[("worker@.service", template("v2").as_str())],
+        "update worker template",
+    );
+
+    // Wait for the sync to pick up the new commit.
+    wait_until(
+        Duration::from_secs(15),
+        "sync to pick up template update",
+        || {
+            fs::read_to_string(PathBuf::from(data_dir()).join("myapp/worker@.service"))
+                .map(|c| c.contains("v2"))
+                .unwrap_or(false)
+        },
+    );
+
+    // The running instance is restarted: its ActiveEnterTimestamp moves.
+    wait_until(
+        Duration::from_secs(30),
+        "worker@2.service to be restarted by sync",
+        || active_enter_timestamp("worker@2.service") != before,
+    );
+
+    // Give sync a moment to (incorrectly) start the stopped instance.
+    thread::sleep(Duration::from_secs(3));
+
+    assert!(
+        !systemctl(&["is-active", "--quiet", "worker@1.service"]),
+        "worker@1.service should NOT have been started by sync (stopped instance of a changed template)"
+    );
+    assert!(
+        systemctl(&["is-active", "--quiet", "worker@2.service"]),
+        "worker@2.service should still be active after the restart"
+    );
+
+    assert!(is_service_active(), "sync service should still be running");
+}

@@ -110,6 +110,8 @@ Relationships that never make systemd start a unit do not count: `PartOf=` only 
 
 Units that stay stopped are left alone, and their container images are not pre-pulled. Images are still pre-pulled for units systemd starts as a dependency of a unit sync starts, such as an `.image` unit required by a `.container`.
 
+A changed template unit (`myapp@.container`) is expanded to the instances systemd has loaded, and each instance is then judged by the same two rules: running instances are restarted, stopped or failed ones are started only when an active unit wants or requires them. A template whose instances all stay stopped is not pre-pulled either.
+
 SSH known hosts are stored in the data directory (`.known_hosts` file) to avoid issues with system SSH config under systemd sandboxing. Use `--accept-new-host-keys` for initial setup to automatically accept host keys on first connect, or `-i` for fully interactive SSH (manual host key approval, credential prompts).
 
 ### Version
