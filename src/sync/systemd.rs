@@ -87,6 +87,12 @@ impl UnitState {
 ///   leaves it inactive — starting it during sync would diverge from the
 ///   state a reboot produces. See the note in `plan_activation` about the
 ///   pre-pull side of this trade-off.
+///
+///   This does not make sync ignore triggered services: `plan_activation`
+///   tests `is_active` first and short-circuits, so a socket-activated
+///   service that happens to be running when its file changes is restarted
+///   like any other active unit. This property set only ever gates the
+///   *inactive* branch.
 /// - `ConflictedBy` (inverse of `Conflicts=`): a negative relationship. An
 ///   active conflicting unit forces this one *stopped*.
 /// - `StopPropagatedFrom`/`ReloadPropagatedFrom` (inverses of
@@ -95,11 +101,17 @@ impl UnitState {
 /// - `Before`/`After`: pure ordering. They constrain *when* a unit starts
 ///   relative to another, never *whether* it starts at all.
 ///
-/// The names must match systemd's spelling exactly: `systemctl show` prints an
-/// empty value for an unknown property and still exits 0, so a typo would
-/// silently degrade to "no reverse dependencies" instead of failing loudly.
-/// They are verified against `systemd.unit(5)` and the `org.freedesktop.systemd1`
-/// `Unit` interface.
+/// The names must match systemd's spelling exactly. `systemctl show` fetches
+/// the unit's properties over D-Bus and filters the reply against the names
+/// asked for, so a name the running systemd does not know simply matches
+/// nothing: no line is emitted for it and the exit status is still 0. A typo
+/// would therefore degrade silently to "no reverse dependencies" rather than
+/// failing loudly. The names are verified against `systemd.unit(5)` and the
+/// `org.freedesktop.systemd1` `Unit` interface.
+///
+/// The same mechanism makes an old systemd degrade gracefully: `UpheldBy`
+/// arrived in systemd 249, and below that it contributes nothing instead of
+/// erroring.
 const START_AUTHORISING_PROPERTIES: [&str; 4] = ["WantedBy", "RequiredBy", "BoundBy", "UpheldBy"];
 
 /// Parse the unit names out of a `systemctl show --value` listing of
@@ -107,11 +119,14 @@ const START_AUTHORISING_PROPERTIES: [&str; 4] = ["WantedBy", "RequiredBy", "Boun
 ///
 /// Splitting the whole output on whitespace unions the properties, which is
 /// only sound because every queried property authorises a start identically —
-/// none of them needs to be told apart from the others. `--value` output is
-/// positional (bare values in systemd's own property order, with an empty line
-/// per empty property), so it could not distinguish them anyway; a property
+/// none of them needs to be told apart from the others. `--value` prints bare
+/// values in systemd's own property order, one line per property, with nothing
+/// to say which line is which: a property that is *known but empty* emits a
+/// blank line, and a property the running systemd does not implement (such as
+/// `UpheldBy` before systemd 249) emits no line at all, silently shifting
+/// every later line up. Positions are therefore unusable, and a property
 /// needing different treatment would have to be fetched without `--value` and
-/// parsed as `KEY=value` lines instead.
+/// parsed as `KEY=value` lines instead. The union is immune to both cases.
 ///
 /// Unit names never contain whitespace, so the split is unambiguous. Results
 /// are deduplicated: a unit that both wants and requires this one is listed by
@@ -488,6 +503,8 @@ mod tests {
 
     #[test]
     fn parse_reverse_deps_handles_multiple_units_per_property() {
+        // `WantedBy` names two targets on one line; `BoundBy` and `UpheldBy`
+        // are known but empty and contribute the two trailing blank lines.
         let stdout = "multi-user.target default.target\nconsumer.service\n\n\n";
         assert_eq!(
             parse_reverse_deps(stdout),
@@ -501,13 +518,29 @@ mod tests {
 
     #[test]
     fn parse_reverse_deps_skips_empty_properties() {
-        // Only `UpheldBy` is populated; the three empty properties emit blank
-        // lines that must not become dependency names.
+        // Only `UpheldBy` is populated; the three properties that are known
+        // but empty emit blank lines that must not become dependency names.
         assert_eq!(
             parse_reverse_deps("\n\n\nsupervisor.service\n"),
             vec!["supervisor.service".to_string()]
         );
         assert_eq!(parse_reverse_deps("\n\n\n\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn parse_reverse_deps_handles_properties_the_systemd_does_not_implement() {
+        // `systemctl show` filters the D-Bus reply against the requested
+        // names, so a property this systemd does not know emits *no* line
+        // rather than a blank one. On systemd < 249 `UpheldBy` does not exist,
+        // so only three lines come back — the union does not care that the
+        // remaining lines shifted up.
+        assert_eq!(
+            parse_reverse_deps("default.target\n\n\n"),
+            vec!["default.target".to_string()]
+        );
+        // A hypothetical systemd knowing none of the four (or a typo in every
+        // name) yields no output at all, which is the intended fail-closed
+        // "no reverse dependencies".
         assert_eq!(parse_reverse_deps(""), Vec::<String>::new());
     }
 

@@ -128,10 +128,12 @@ impl ActivationPlan {
 ///   Relationships that do *not* start a unit are excluded, so `PartOf=`
 ///   (stop/restart propagation only) and `Requisite=` never cause a start
 ///   here. Socket-, timer- and path-activated services (`TriggeredBy`) are
-///   also left alone: boot leaves them inactive until the trigger fires, and
-///   starting them eagerly would diverge from that. The cost is that their
-///   images are not pre-pulled either, since this same classification decides
-///   the pre-pull — see the note on `ActivationPlan::activating`.
+///   also left alone *while inactive*: boot leaves them stopped until the
+///   trigger fires, and starting them eagerly would diverge from that. One
+///   that happens to be running is caught by the active branch above and
+///   restarted like anything else. The cost is that an inactive triggered
+///   service's image is not pre-pulled either, since this same classification
+///   decides the pre-pull — see the note on `ActivationPlan::activating`.
 ///
 /// Planning performs no systemd state changes and logs nothing; the verbose
 /// account of the decisions is stored on the plan and written out by
@@ -670,34 +672,18 @@ mod tests {
         }
     }
 
-    #[rstest]
-    // `PartOf=parent.target` only propagates stop and restart, so
-    // `reverse_deps` never reports `parent.target` and the unit stays down —
-    // exactly what a reboot would leave behind.
-    #[case::part_of_active_parent("parent.target")]
-    // A running `.socket` means the service is ready to be *triggered*, not
-    // that it should be running; `TriggeredBy` is not queried.
-    #[case::triggered_by_active_socket("app.socket")]
-    // `Requisite=` checks this unit rather than starting it.
-    #[case::requisite_of_active_unit("dependant.service")]
-    fn inactive_unit_with_non_starting_relationship_stays_stopped(#[case] related: &str) {
-        let systemd = MockSystemd::new();
-        systemd.active_set.borrow_mut().insert(related.to_string());
-        // Empty: none of these relationships appears in the properties
-        // `reverse_deps` asks systemctl for.
-        systemd
-            .reverse_deps_map
-            .borrow_mut()
-            .insert("app.service".to_string(), Vec::new());
-        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
-
-        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
-        execute_activation(&systemd, &plan, &cfg);
-
-        assert!(systemd.started.borrow().is_empty());
-        assert!(systemd.restarted.borrow().is_empty());
-        assert!(!plan.activates_file("app.container"));
-    }
+    // Note on what is *not* tested here. The relationships that must never
+    // authorise a start — `ConsistsOf` (`PartOf=`), `TriggeredBy` (socket,
+    // timer and path activation), `RequisiteOf` (`Requisite=`) and the rest —
+    // cannot be pinned at this level: `MockSystemd::reverse_deps_map` returns
+    // whatever a test puts in it, so a unit with no reverse dependencies stays
+    // stopped regardless of which properties the real `reverse_deps` asks
+    // systemctl for. A test here would pass even if `TriggeredBy` were added
+    // to the queried set. The exclusions are pinned where they are decided
+    // instead: `reverse_deps_properties_exclude_non_starting_relationships` in
+    // `sync::systemd` guards the property list, and
+    // `reverse_deps_queries_only_start_authorising_properties` in
+    // `tests/fake_systemd.rs` guards the systemctl arguments actually sent.
 
     #[test]
     fn plan_activates_unit_upheld_by_a_started_unit() {

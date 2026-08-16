@@ -208,8 +208,10 @@ fn reverse_deps_queries_only_start_authorising_properties() {
     // Without FAKE_STDOUT the fake echoes its argv, so the parsed "deps" are
     // the systemctl arguments — enough to pin down which properties are asked
     // for. Property names must match systemd's spelling exactly: `systemctl
-    // show` returns an empty value for an unknown property and exits 0, so a
-    // typo would silently look like "no reverse dependencies".
+    // show` filters the D-Bus reply against the names asked for, so an
+    // unrecognised name matches nothing — no line is emitted and the exit
+    // status is still 0. A typo would silently look like "no reverse
+    // dependencies", which is why the flags are pinned here.
     let sd = fake_systemd(0);
     let cfg = test_cfg(false, false);
 
@@ -222,13 +224,16 @@ fn reverse_deps_queries_only_start_authorising_properties() {
         );
     }
     // `PartOf=` propagates stop/restart only, `Requisite=` never starts,
-    // socket/timer activation is on demand, `Conflicts=` stops.
+    // socket/timer activation is on demand, `Conflicts=` stops, and the
+    // propagation properties carry stop and reload rather than start. Kept in
+    // step with the sibling assertion in `sync::systemd`.
     for excluded in [
         "ConsistsOf",
         "RequisiteOf",
         "TriggeredBy",
         "ConflictedBy",
         "StopPropagatedFrom",
+        "ReloadPropagatedFrom",
     ] {
         assert!(
             !args.contains(&format!("--property={excluded}")),
