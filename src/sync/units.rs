@@ -517,7 +517,11 @@ pub(crate) fn activate_changed_units_inner(
 /// - **Templates** (`foo@.service`): every loaded instance is stopped.
 ///   `systemctl stop` on an already-inactive instance is a no-op, and passing
 ///   it along makes sure nothing half-running survives the file's removal.
-/// - **Regular units**: stopped only if currently active.
+/// - **Regular units**: stopped if systemd is running them or bringing them
+///   up — active, activating, or holding a queued start job. The last two
+///   matter for the same reason as the ordering above: a unit that is only
+///   part-way up still ends up with a container nothing can stop once its
+///   file is gone.
 pub(crate) fn stop_deleted_units_inner(
     systemd: &dyn SystemdTrait,
     deleted_files: &[String],
@@ -535,6 +539,7 @@ pub(crate) fn stop_deleted_units_inner(
     }
 
     let mut to_stop: Vec<String> = Vec::new();
+    let mut active = ActiveStates::new(systemd);
 
     for unit in &units {
         if is_template_unit(unit) {
@@ -558,12 +563,18 @@ pub(crate) fn stop_deleted_units_inner(
             continue;
         }
 
-        if systemd.is_active(unit, cfg) {
+        // Anything systemd is running *or bringing up* has to be stopped here.
+        // A unit caught mid-start would otherwise finish starting its
+        // container moments before `daemon-reload` removes the unit file, and
+        // the container is then orphaned with nothing left to stop it. A
+        // queued start job is the same problem one step earlier: stopping the
+        // unit cancels the job before it can run.
+        if active.is_coming_up(unit, cfg) {
             to_stop.push(unit.clone());
         } else if cfg.verbose {
             let _ = writeln!(
                 cfg.output.err(),
-                "[quadcd] Not stopping deleted {unit} (not active)"
+                "[quadcd] Not stopping deleted {unit} (not running and not coming up)"
             );
         }
     }
@@ -1741,6 +1752,53 @@ mod tests {
         let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
 
         stop_deleted_units_inner(&systemd, &["gone.container".to_string()], &cfg);
+
+        assert!(systemd.stopped.borrow().is_empty());
+    }
+
+    #[test]
+    fn stop_deleted_units_inner_stops_activating_unit() {
+        // A unit caught mid-start would finish bringing its container up just
+        // before `daemon-reload` removes the unit file, orphaning it.
+        let systemd = MockSystemd::new();
+        systemd
+            .activating_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        stop_deleted_units_inner(&systemd, &["app.container".to_string()], &cfg);
+
+        assert_eq!(systemd.stopped.borrow().as_slice(), &["app.service"]);
+    }
+
+    #[test]
+    fn stop_deleted_units_inner_stops_unit_with_queued_start_job() {
+        // Stopping cancels the queued job before it can start a unit whose
+        // file is about to disappear.
+        let systemd = MockSystemd::new();
+        systemd
+            .queued_start_jobs
+            .borrow_mut()
+            .push("app.service".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        stop_deleted_units_inner(&systemd, &["app.container".to_string()], &cfg);
+
+        assert_eq!(systemd.stopped.borrow().as_slice(), &["app.service"]);
+    }
+
+    #[test]
+    fn stop_deleted_units_inner_leaves_stopped_unit_alone() {
+        // Inactive with no job of any kind: nothing to orphan.
+        let systemd = MockSystemd::new();
+        systemd
+            .queued_start_jobs
+            .borrow_mut()
+            .push("other.service".to_string());
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        stop_deleted_units_inner(&systemd, &["app.container".to_string()], &cfg);
 
         assert!(systemd.stopped.borrow().is_empty());
     }
