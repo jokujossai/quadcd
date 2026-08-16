@@ -95,6 +95,12 @@ impl SystemdTrait for NoopSystemd {
     fn is_active(&self, _unit: &str, _cfg: &Config) -> bool {
         false
     }
+    fn is_active_or_activating(&self, _unit: &str, _cfg: &Config) -> bool {
+        false
+    }
+    fn pending_start_jobs(&self, _cfg: &Config) -> Vec<String> {
+        vec![]
+    }
     fn reverse_deps(&self, _unit: &str, _cfg: &Config) -> Vec<String> {
         vec![]
     }

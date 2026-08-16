@@ -114,10 +114,11 @@ impl ActivationPlan {
 /// - **Active** units: `restart` — a running unit whose file changed keeps
 ///   running with the new configuration.
 /// - **Inactive** units: `start` only if some unit whose own activation would
-///   drag them up is active — `Wants=`, `Requires=`, `BindsTo=` or
-///   `Upholds=`, seen from this side as the reverse properties in
-///   `START_AUTHORISING_PROPERTIES`. This mirrors boot: quadcd-deployed units
-///   are all `generated`, so what starts them at boot is another unit
+///   drag them up is *coming up* — active, activating, or holding a queued
+///   start job. The relationships that qualify are `Wants=`, `Requires=`,
+///   `BindsTo=` and `Upholds=`, seen from this side as the reverse properties
+///   in `START_AUTHORISING_PROPERTIES`. This mirrors boot: quadcd-deployed
+///   units are all `generated`, so what starts them at boot is another unit
 ///   declaring one of those relationships (typically `default.target` via a
 ///   `.wants`/`.requires` link materialised from `[Install]`). Anything else
 ///   — including units an operator stopped by hand — is left alone, so sync
@@ -127,6 +128,16 @@ impl ActivationPlan {
 ///   A template is not itself startable, so it never appears in the action
 ///   lists; an instance an operator stopped (or one that failed and nothing
 ///   active wants) is left alone exactly like a stopped regular unit.
+///
+///   The queued-job case is what makes the first sync of a boot work. A target
+///   implicitly orders itself after the units it wants, and only reaches
+///   `active` once their jobs have finished, so for the whole early-boot
+///   window `multi-user.target` / `default.target` reads
+///   `ActiveState=inactive`, `SubState=dead` with a pending job — targets
+///   never report `activating`. Without the job check every freshly cloned
+///   unit looks unwanted. The invariant survives: an operator-stopped unit is
+///   `inactive` with *no* job, and a unit on its way *down* holds a `stop`
+///   job, which does not count.
 ///
 ///   Relationships that do *not* start a unit are excluded, so `PartOf=`
 ///   (stop/restart propagation only) and `Requisite=` never cause a start
@@ -162,7 +173,7 @@ pub(crate) fn plan_activation(
     // instance can mark the template file for pre-pull.
     let mut templates: HashMap<String, String> = HashMap::new();
     // `default.target` is usually the reverse dependency of every changed
-    // unit, and each lookup spawns a `systemctl is-active`.
+    // unit, and each lookup spawns a systemctl call.
     let mut active = ActiveStates::new(systemd);
 
     for unit in &units {
@@ -219,7 +230,7 @@ pub(crate) fn plan_activation(
     for (unit, deps) in &skipped {
         plan.note(cfg, || {
             format!(
-                "Skipping inactive {unit} (no active unit would start it; would be started by: [{}])",
+                "Skipping inactive {unit} (nothing that would start it is coming up; would be started by: [{}])",
                 deps.join(", ")
             )
         });
@@ -233,10 +244,10 @@ pub(crate) fn plan_activation(
 enum Action {
     /// Active unit: restart it into the new configuration.
     Restart,
-    /// Inactive unit some active unit wants or requires: start it.
+    /// Inactive unit that something coming up wants or requires: start it.
     Start,
-    /// Left alone — nothing active wants it, so boot would not start it
-    /// either.
+    /// Left alone — nothing that would start it is coming up, so boot would
+    /// not start it either.
     Skip,
 }
 
@@ -256,6 +267,16 @@ fn plan_unit(
     skipped: &mut Vec<(String, Vec<String>)>,
     cfg: &Config,
 ) -> Action {
+    // The unit's own state is deliberately tested with plain `is_active`: a
+    // unit that is mid-start falls through to the branch below and is
+    // `start`ed rather than `restart`ed. `systemctl start` on an activating
+    // unit is close to a no-op — systemd merges it into the job already in
+    // flight — whereas `restart` would abort a start that is already underway
+    // (tearing down a container that is just coming up) and, during boot,
+    // fight the target that queued that job. The trade-off is that such a unit
+    // may finish coming up with the pre-change configuration; the window is
+    // only the moments between its job being queued and this sync, and the new
+    // file is on disk for its next start.
     if active.is_active(unit, cfg) {
         // Always restart a running unit whose file changed.
         plan.to_restart.push(unit.to_string());
@@ -264,12 +285,11 @@ fn plan_unit(
     }
 
     // Inactive: start only if boot would — i.e. some unit that would itself
-    // start this one (wants, requires, binds to, or upholds it) is active.
-    // `[Install]` links show up here as active targets (e.g. default.target);
-    // a unit nothing depends on, or one whose dependants are stopped, stays
-    // stopped.
+    // start this one (wants, requires, binds to, or upholds it) is coming up.
+    // `[Install]` links show up here as targets (e.g. default.target); a unit
+    // nothing depends on, or one whose dependants are stopped, stays stopped.
     let deps = systemd.reverse_deps(unit, cfg);
-    if deps.iter().any(|dep| active.is_active(dep, cfg)) {
+    if deps.iter().any(|dep| active.is_coming_up(dep, cfg)) {
         plan.to_start.push(unit.to_string());
         mark_activating(plan, templates, unit);
         Action::Start
@@ -292,29 +312,63 @@ fn mark_activating(plan: &mut ActivationPlan, templates: &HashMap<String, String
 }
 
 /// Memoised `is_active` lookups for one planning pass.
+/// Memoised unit-state lookups for one planning pass.
 ///
-/// Every miss spawns a `systemctl is-active`, and the same few targets are
-/// otherwise queried once per changed unit.
+/// Every miss spawns a systemctl call, and the same few targets are otherwise
+/// queried once per changed unit. The two per-unit questions are cached
+/// separately because they come from different systemctl invocations and
+/// neither answer can be derived from the other; the job list is a single
+/// whole-system query, fetched at most once and only if it is needed.
 struct ActiveStates<'a> {
     systemd: &'a dyn SystemdTrait,
-    known: HashMap<String, bool>,
+    active: HashMap<String, bool>,
+    active_or_activating: HashMap<String, bool>,
+    queued_start_jobs: Option<HashSet<String>>,
 }
 
 impl<'a> ActiveStates<'a> {
     fn new(systemd: &'a dyn SystemdTrait) -> Self {
         Self {
             systemd,
-            known: HashMap::new(),
+            active: HashMap::new(),
+            active_or_activating: HashMap::new(),
+            queued_start_jobs: None,
         }
     }
 
     fn is_active(&mut self, unit: &str, cfg: &Config) -> bool {
-        if let Some(&known) = self.known.get(unit) {
+        if let Some(&known) = self.active.get(unit) {
             return known;
         }
         let active = self.systemd.is_active(unit, cfg);
-        self.known.insert(unit.to_string(), active);
+        self.active.insert(unit.to_string(), active);
         active
+    }
+
+    fn is_active_or_activating(&mut self, unit: &str, cfg: &Config) -> bool {
+        if let Some(&known) = self.active_or_activating.get(unit) {
+            return known;
+        }
+        let running = self.systemd.is_active_or_activating(unit, cfg);
+        self.active_or_activating.insert(unit.to_string(), running);
+        running
+    }
+
+    fn has_queued_start_job(&mut self, unit: &str, cfg: &Config) -> bool {
+        self.queued_start_jobs
+            .get_or_insert_with(|| self.systemd.pending_start_jobs(cfg).into_iter().collect())
+            .contains(unit)
+    }
+
+    /// Is systemd bringing this unit up, or has it already?
+    ///
+    /// Three distinct states answer yes, and none of them can stand in for the
+    /// others: `active` (running), `activating` (a service part-way through
+    /// starting), and `inactive` with a queued start job (a target waiting for
+    /// the units ordered before it — how a boot target looks while quadcd's
+    /// first sync runs).
+    fn is_coming_up(&mut self, unit: &str, cfg: &Config) -> bool {
+        self.is_active_or_activating(unit, cfg) || self.has_queued_start_job(unit, cfg)
     }
 }
 
@@ -795,6 +849,164 @@ mod tests {
         assert!(plan.activates_file("helper.container"));
 
         // systemd upholds it; sync must not name it in the start command.
+        execute_activation(&systemd, &plan, &cfg);
+        assert_eq!(systemd.started.borrow().as_slice(), &["web.service"]);
+    }
+
+    // Reverse dependencies that are coming up (boot-time behaviour)
+
+    #[test]
+    fn activate_inactive_unit_wanted_by_target_with_queued_job_starts() {
+        // The boot case, as systemd actually reports it: a target that is
+        // waiting for the units ordered before it stays `ActiveState=inactive`
+        // (targets never report `activating`) and carries a queued start job.
+        // It is on its way up and will pull in what it wants, so it authorises
+        // the start.
+        let systemd = MockSystemd::new();
+        systemd
+            .queued_start_jobs
+            .borrow_mut()
+            .push("default.target".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
+        assert!(
+            plan.activates_file("app.container"),
+            "a dependency with a queued start job must mark the unit for activation so its image is pre-pulled"
+        );
+
+        execute_activation(&systemd, &plan, &cfg);
+        assert_eq!(systemd.started.borrow().as_slice(), &["app.service"]);
+        assert!(systemd.restarted.borrow().is_empty());
+    }
+
+    #[test]
+    fn activate_inactive_unit_wanted_by_activating_service_starts() {
+        // Services — unlike targets — do report `activating` while starting.
+        let systemd = MockSystemd::new();
+        systemd
+            .activating_set
+            .borrow_mut()
+            .insert("consumer.service".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["consumer.service".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert!(plan.activates_file("app.container"));
+        assert_eq!(systemd.started.borrow().as_slice(), &["app.service"]);
+    }
+
+    #[test]
+    fn activate_inactive_unit_wanted_by_inactive_target_still_skipped() {
+        // The invariant this logic protects: a unit whose dependants are all
+        // stopped — the shape an operator-stopped deployment has — is left
+        // alone. A stopped unit is `inactive` with no job at all, so neither
+        // the activating nor the queued-job check can resurrect it.
+        let systemd = MockSystemd::new();
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["stopped.target".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert!(!plan.activates_file("app.container"));
+        assert!(systemd.started.borrow().is_empty());
+        assert!(systemd.restarted.borrow().is_empty());
+    }
+
+    #[test]
+    fn activate_inactive_unit_whose_dependency_holds_an_unrelated_job_is_skipped() {
+        // Only the reverse dependency's own job counts. A job queued for some
+        // other unit must not leak authorisation to everything else.
+        let systemd = MockSystemd::new();
+        systemd
+            .queued_start_jobs
+            .borrow_mut()
+            .push("elsewhere.service".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["stopped.target".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert!(!plan.activates_file("app.container"));
+        assert!(systemd.started.borrow().is_empty());
+    }
+
+    #[test]
+    fn activate_activating_unit_is_started_not_restarted() {
+        // A changed unit that is itself mid-start is *not* restarted: the
+        // `start` systemd merges into the in-flight job is harmless, while a
+        // restart would tear down a start already underway.
+        let systemd = MockSystemd::new();
+        systemd
+            .active_set
+            .borrow_mut()
+            .insert("default.target".to_string());
+        systemd
+            .activating_set
+            .borrow_mut()
+            .insert("app.service".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        activate_changed_units_inner(&systemd, &["app.container".into()], &cfg);
+
+        assert_eq!(systemd.started.borrow().as_slice(), &["app.service"]);
+        assert!(systemd.restarted.borrow().is_empty());
+    }
+
+    #[test]
+    fn activate_fresh_clone_during_boot_starts_units_and_marks_dependencies() {
+        // End-to-end shape of the fresh-host bug: every unit file counts as
+        // changed, nothing is running yet, and the only reverse dependency is
+        // the boot target quadcd's own sync unit is wanted by — which is
+        // `inactive` with a queued start job for as long as the units ordered
+        // before it, quadcd's sync among them, are still coming up.
+        let systemd = MockSystemd::new();
+        systemd
+            .queued_start_jobs
+            .borrow_mut()
+            .push("multi-user.target".to_string());
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "web.service".to_string(),
+            vec!["multi-user.target".to_string()],
+        );
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "web-image.service".to_string(),
+            vec!["web.service".to_string()],
+        );
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(
+            &systemd,
+            &["web.container".into(), "web.image".into()],
+            &cfg,
+        );
+
+        // Both files are pre-pull candidates: the container is started, the
+        // image unit is dragged in by it.
+        assert!(plan.activates_file("web.container"));
+        assert!(plan.activates_file("web.image"));
+
         execute_activation(&systemd, &plan, &cfg);
         assert_eq!(systemd.started.borrow().as_slice(), &["web.service"]);
     }

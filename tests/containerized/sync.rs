@@ -580,3 +580,152 @@ fn service_sync_does_not_start_stopped_template_instance() {
 
     assert!(is_service_active(), "sync service should still be running");
 }
+
+/// Guard for [`sync_starts_unit_wanted_by_target_with_queued_job`]: releases
+/// the gate service and removes the hand-written units even if an assertion
+/// panics first, since a blocked gate would otherwise hold a systemd job open
+/// for the rest of the run.
+struct QueuedJobTargetGuard {
+    release_marker: String,
+    unit_files: Vec<String>,
+}
+
+impl Drop for QueuedJobTargetGuard {
+    fn drop(&mut self) {
+        // Let the gate's ExecStart return so the target's job can complete.
+        let _ = fs::write(&self.release_marker, "release\n");
+        let _ = systemctl(&["stop", "quadcd-hold.target"]);
+        let _ = systemctl(&["stop", "quadcd-gate.service"]);
+        let _ = systemctl(&["stop", "holdme.service"]);
+        let _ = fs::remove_file(&self.release_marker);
+        for f in &self.unit_files {
+            let _ = fs::remove_file(f);
+        }
+        let _ = systemctl(&["daemon-reload"]);
+    }
+}
+
+/// A changed, inactive unit must be started when the target that wants it has
+/// a queued start job.
+///
+/// This is the boot case. A target implicitly orders itself after the units it
+/// wants, and its own job cannot complete until theirs have, so for the whole
+/// early-boot window in which quadcd's first sync runs (from
+/// `quadcd-sync.service`, `WantedBy=multi-user.target`/`default.target`) the
+/// boot target reads `ActiveState=inactive`, `SubState=dead` with a queued
+/// start job. Targets never report `activating`: their only states are
+/// `inactive` and `active`. So a freshly cloned unit used to look unwanted —
+/// its `[Install]` target was "not active" — and a fresh host started nothing
+/// until its next boot.
+///
+/// The target is held with its job queued deterministically rather than by a
+/// sleep: a gate service ordered before it blocks until the test writes a
+/// marker file, so the window stays open for exactly as long as the test needs.
+#[test]
+#[ignore]
+fn sync_starts_unit_wanted_by_target_with_queued_job() {
+    let _ctx = SyncTestContext::new();
+
+    let unit_dir = PathBuf::from(systemd_unit_dir());
+    fs::create_dir_all(&unit_dir).unwrap();
+    let uid = unsafe { libc::getuid() };
+    let release_marker = format!("/tmp/quadcd-gate-release-{uid}");
+    let gate_path = unit_dir.join("quadcd-gate.service");
+    let target_path = unit_dir.join("quadcd-hold.target");
+
+    let _guard = QueuedJobTargetGuard {
+        release_marker: release_marker.clone(),
+        unit_files: vec![
+            gate_path.to_string_lossy().into_owned(),
+            target_path.to_string_lossy().into_owned(),
+        ],
+    };
+
+    let _ = fs::remove_file(&release_marker);
+    fs::write(
+        &gate_path,
+        format!(
+            "[Unit]\nDescription=quadcd test gate\n\n\
+             [Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=300\n\
+             ExecStart=/bin/sh -c 'while [ ! -e {release_marker} ]; do sleep 0.1; done'\n"
+        ),
+    )
+    .unwrap();
+    // `Wants=`/`After=` on the target rather than `[Install]` on the gate, so
+    // no `systemctl enable` is needed. The `After=` is what a boot target adds
+    // implicitly for everything it wants; spelling it out keeps the test from
+    // depending on that implicit behaviour.
+    fs::write(
+        &target_path,
+        "[Unit]\nDescription=quadcd hold target\n\
+         Wants=quadcd-gate.service\nAfter=quadcd-gate.service\n",
+    )
+    .unwrap();
+    assert!(systemctl(&["daemon-reload"]), "daemon-reload failed");
+
+    // --no-block: the start returns immediately, leaving the job queued.
+    assert!(
+        systemctl(&["start", "--no-block", "quadcd-hold.target"]),
+        "failed to queue quadcd-hold.target"
+    );
+    wait_until(
+        Duration::from_secs(30),
+        "quadcd-hold.target to have a queued start job",
+        || has_queued_start_job("quadcd-hold.target"),
+    );
+    // The state that made the old check fail: the target is *not* running and
+    // not `activating`, it is plain `inactive` with a job attached.
+    assert_eq!(
+        active_state("quadcd-hold.target"),
+        "inactive",
+        "a target waiting on its ordering dependencies should be inactive"
+    );
+
+    // A unit installed into the held target only — nothing active wants it.
+    let bare = create_bare_repo(
+        "holding",
+        &[(
+            "holdme.service",
+            "[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/bin/true\n\n\
+             [Install]\nWantedBy=quadcd-hold.target\n",
+        )],
+    );
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.holding]\nurl = \"{}\"\ninterval = \"60s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    // One-shot sync so the whole reload/activate cycle has finished by the
+    // time the assertions run.
+    let mut args: Vec<&str> = vec!["sync", "-v"];
+    if is_user_mode() {
+        args.push("--user");
+    }
+    let output = run_quadcd(&args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "quadcd sync should succeed, stderr: {stderr}"
+    );
+
+    // The job must still have been queued while sync ran, or the test would
+    // prove nothing.
+    assert!(
+        has_queued_start_job("quadcd-hold.target"),
+        "the gate should still be holding the target's job, stderr: {stderr}"
+    );
+    // Assert on quadcd's own decision, not only the resulting unit state, so
+    // the test cannot pass because systemd happened to pull the unit in.
+    assert!(
+        stderr.contains("Starting units: holdme.service"),
+        "sync should start a unit wanted by a target with a queued start job, stderr: {stderr}"
+    );
+    assert!(
+        was_unit_started("holdme.service"),
+        "holdme.service should have been started, stderr: {stderr}"
+    );
+}

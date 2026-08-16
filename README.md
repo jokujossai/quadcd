@@ -102,7 +102,9 @@ quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i] [-
 
 Sync pulls unit files from configured git repositories into the data directory, then triggers `systemctl daemon-reload` and restarts changed units with `systemctl restart`.
 
-A changed unit is restarted when it is active, and started when it is inactive but some active unit would itself start it — that is, an active unit declares `Wants=`, `Requires=`, `BindsTo=` or `Upholds=` on it (seen from the changed unit's side as `WantedBy=`, `RequiredBy=`, `BoundBy=` and `UpheldBy=`). This approximates what a reboot would bring up, so a unit stopped by hand is not resurrected.
+A changed unit is restarted when it is active, and started when it is inactive but some unit that is *coming up* would itself start it — that is, that unit declares `Wants=`, `Requires=`, `BindsTo=` or `Upholds=` on it (seen from the changed unit's side as `WantedBy=`, `RequiredBy=`, `BoundBy=` and `UpheldBy=`). This approximates what a reboot would bring up, so a unit stopped by hand is not resurrected.
+
+"Coming up" means active, activating, or holding a queued start job. The last case is what makes the first sync after a reboot work: a target only reaches `active` once the units ordered before it have started, so while quadcd's own sync unit runs during boot, the boot target it is installed into is still `inactive` with its start job queued.
 
 Relationships that never make systemd start a unit do not count: `PartOf=` only propagates stop and restart, `Requisite=` checks a unit rather than starting it, and `Conflicts=` stops it. Socket-, timer- and path-activated services are also left alone while inactive — the point of `TriggeredBy=` activation is that the service starts on demand, and a reboot leaves it inactive until the trigger fires. (One that is already running when its file changes is restarted like any other active unit.)
 

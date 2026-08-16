@@ -270,6 +270,106 @@ fn reverse_deps_error_returns_empty() {
     assert!(sd.reverse_deps("myapp.service", &cfg).is_empty());
 }
 
+// is_active_or_activating
+
+#[test]
+fn is_active_or_activating_true_for_activating() {
+    // `systemctl is-active --quiet` would exit non-zero here; the ActiveState
+    // reported by `systemctl show` is what makes the difference.
+    let sd = fake_systemd_stdout("ActiveState=activating\nSubState=start", 0);
+    let cfg = test_cfg(false, false);
+
+    assert!(sd.is_active_or_activating("myapp.service", &cfg));
+}
+
+#[test]
+fn is_active_or_activating_true_for_active() {
+    let sd = fake_systemd_stdout("ActiveState=active\nSubState=running", 0);
+    let cfg = test_cfg(false, false);
+
+    assert!(sd.is_active_or_activating("myapp.target", &cfg));
+}
+
+#[test]
+fn is_active_or_activating_false_for_inactive() {
+    let sd = fake_systemd_stdout("ActiveState=inactive\nSubState=dead", 0);
+    let cfg = test_cfg(false, false);
+
+    assert!(!sd.is_active_or_activating("myapp.target", &cfg));
+}
+
+#[test]
+fn is_active_or_activating_false_on_command_failure() {
+    let sd = fake_systemd(1);
+    let cfg = test_cfg(false, false);
+
+    assert!(!sd.is_active_or_activating("myapp.target", &cfg));
+}
+
+// pending_start_jobs
+
+/// Real `systemctl list-jobs` output, captured from the containerized test
+/// environment while a target waited on a blocked service.
+const LIST_JOBS_OUTPUT: &str = "JOB UNIT                  TYPE  STATE\n\
+     208 probe-implicit.target start waiting\n\
+     175 probe-explicit.target start waiting\n\
+     48  quadcd-test.service   start running\n\
+     \n\
+     5 jobs listed.";
+
+#[test]
+fn pending_start_jobs_parses_units_with_start_jobs() {
+    let sd = fake_systemd_stdout(LIST_JOBS_OUTPUT, 0);
+    let cfg = test_cfg(false, false);
+
+    assert_eq!(
+        sd.pending_start_jobs(&cfg),
+        vec![
+            "probe-implicit.target".to_string(),
+            "probe-explicit.target".to_string(),
+            "quadcd-test.service".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn pending_start_jobs_ignores_legend_and_footer() {
+    // The parse must not depend on `--no-legend` stripping the decorations:
+    // the header's type column reads `TYPE` and the footer is too short.
+    let sd = fake_systemd_stdout(LIST_JOBS_OUTPUT, 0);
+    let cfg = test_cfg(false, false);
+
+    let jobs = sd.pending_start_jobs(&cfg);
+    assert!(!jobs.iter().any(|u| u == "UNIT"), "jobs: {jobs:?}");
+    assert!(!jobs.iter().any(|u| u == "jobs"), "jobs: {jobs:?}");
+}
+
+#[test]
+fn pending_start_jobs_excludes_stop_and_reload_jobs() {
+    // A unit on its way *down* must not look like one coming up.
+    let sd = fake_systemd_stdout(
+        "12 shutdown.target      start   waiting\n\
+         13 multi-user.target    stop    waiting\n\
+         14 app.service          reload  running\n\
+         15 web.service          restart running",
+        0,
+    );
+    let cfg = test_cfg(false, false);
+
+    assert_eq!(
+        sd.pending_start_jobs(&cfg),
+        vec!["shutdown.target".to_string(), "web.service".to_string()]
+    );
+}
+
+#[test]
+fn pending_start_jobs_empty_on_command_failure() {
+    let sd = fake_systemd(1);
+    let cfg = test_cfg(false, false);
+
+    assert!(sd.pending_start_jobs(&cfg).is_empty());
+}
+
 #[test]
 fn list_units_matching_parses_output() {
     let sd = fake_systemd_stdout(

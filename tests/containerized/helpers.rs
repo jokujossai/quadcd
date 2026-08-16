@@ -39,6 +39,16 @@ pub fn repos_dir() -> String {
     format!("/tmp/quadcd-test-repos-{uid}")
 }
 
+/// Directory systemd reads hand-written unit files from, for tests that need
+/// a unit of their own alongside the ones quadcd generates.
+pub fn systemd_unit_dir() -> &'static str {
+    if is_user_mode() {
+        "/home/quadcd-test/.config/systemd/user"
+    } else {
+        "/etc/systemd/system"
+    }
+}
+
 /// Boot target for `[Install] WantedBy=` in test fixtures.
 pub fn wanted_by() -> &'static str {
     if is_user_mode() {
@@ -261,6 +271,42 @@ pub fn active_enter_timestamp(unit: &str) -> String {
 pub fn wait_for_unit_start(unit: &str, timeout: Duration) {
     let desc = format!("{unit} to have been started");
     wait_until(timeout, &desc, || was_unit_started(unit));
+}
+
+/// Return a unit's raw `ActiveState` (`active`, `activating`, `inactive`, …).
+///
+/// `systemctl is-active` cannot distinguish `activating` from a failure by
+/// exit code, so tests that care about the exact state have to read the
+/// property.
+pub fn active_state(unit: &str) -> String {
+    let mut cmd = Command::new("systemctl");
+    if is_user_mode() {
+        cmd.arg("--user");
+    }
+    let output = cmd
+        .args(["show", "-p", "ActiveState", "--value", unit])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Return `true` if a start job for this unit is queued (waiting or running).
+///
+/// A unit whose start job is queued but not yet run is still `inactive`; the
+/// job is the only thing that distinguishes it from a stopped unit.
+pub fn has_queued_start_job(unit: &str) -> bool {
+    let mut cmd = Command::new("systemctl");
+    if is_user_mode() {
+        cmd.arg("--user");
+    }
+    let output = cmd
+        .args(["list-jobs", "--no-legend", "--no-pager"])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        f.len() >= 3 && f[1] == unit && f[2] == "start"
+    })
 }
 
 pub fn service_main_pid(unit: &str) -> Option<u32> {

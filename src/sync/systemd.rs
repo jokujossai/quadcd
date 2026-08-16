@@ -155,6 +155,34 @@ pub trait SystemdTrait {
     fn is_enabled(&self, unit: &str, cfg: &Config) -> String;
     /// Return `true` if the unit is currently active (running).
     fn is_active(&self, unit: &str, cfg: &Config) -> bool;
+    /// Return `true` if the unit is active **or** still activating.
+    ///
+    /// `systemctl is-active --quiet` exits non-zero for `activating`, so it
+    /// cannot answer this. A service that is still starting — `Type=oneshot`
+    /// mid-`ExecStart`, `Type=notify` before its ready notification, or one
+    /// waiting out `Restart=` in `activating (auto-restart)` — is on its way
+    /// up and will pull in whatever it wants or requires.
+    ///
+    /// Note this does **not** cover a boot target waiting on its queued jobs:
+    /// target units only ever have the states `inactive` and `active`, never
+    /// `activating`. See [`SystemdTrait::pending_start_jobs`].
+    fn is_active_or_activating(&self, unit: &str, cfg: &Config) -> bool;
+    /// Return the units that have a queued start (or restart) job.
+    ///
+    /// This is the state a boot target is in while the units ordered before it
+    /// are still coming up: `ActiveState=inactive`, `SubState=dead`, and a
+    /// pending job. A target reaches `active` only once every job queued with
+    /// it has finished — and because targets implicitly order themselves after
+    /// the units they want, `multi-user.target` / `default.target` sit there
+    /// for the whole early-boot window in which quadcd's first sync runs. Such
+    /// a unit is indistinguishable from a stopped one by state alone, but the
+    /// queued job says systemd is on its way to bringing it up.
+    ///
+    /// Read from `systemctl list-jobs` rather than per-unit
+    /// `show --property=Job`: the unit property carries only the job id, not
+    /// its type, and a *stop* job — a target on its way down during shutdown —
+    /// must not be mistaken for one coming up. Empty on error.
+    fn pending_start_jobs(&self, cfg: &Config) -> Vec<String>;
     /// Return the units whose activation would make systemd start this unit:
     /// the reverse dependencies `WantedBy`, `RequiredBy`, `BoundBy` and
     /// `UpheldBy` (see `START_AUTHORISING_PROPERTIES` for why those four and
@@ -376,6 +404,47 @@ impl SystemdTrait for Systemd {
             .is_ok_and(|c| c.success())
     }
 
+    fn is_active_or_activating(&self, unit: &str, cfg: &Config) -> bool {
+        // `systemctl is-active --quiet` cannot answer this: it exits non-zero
+        // for a unit in the `activating` state. `systemctl show` reports the
+        // raw `ActiveState` instead, and reusing `show_state` keeps this to a
+        // single systemctl invocation with one parser rather than a
+        // near-duplicate `show --property=ActiveState --value` call.
+        matches!(
+            self.show_state(unit, cfg).active_state.as_str(),
+            "active" | "activating"
+        )
+    }
+
+    fn pending_start_jobs(&self, cfg: &Config) -> Vec<String> {
+        let mut args = Self::user_args(cfg);
+        args.extend(["list-jobs", "--no-legend", "--no-pager"]);
+
+        let Ok(capture) = self.exec().args(args.iter().copied()).capture() else {
+            return Vec::new();
+        };
+        if !capture.success() {
+            return Vec::new();
+        }
+
+        // Columns are `JOB UNIT TYPE STATE`, e.g.
+        //   175 default.target      start waiting
+        //   176 quadcd-sync.service start running
+        // Selecting on the type column also makes the parse independent of
+        // `--no-legend` actually suppressing the decorations: the header row's
+        // type column reads `TYPE` and the `N jobs listed.` footer has too few
+        // columns, so both drop out on their own.
+        String::from_utf8_lossy(&capture.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (_job_id, unit, job_type) = (fields.next()?, fields.next()?, fields.next()?);
+                // `stop` and `reload` jobs say nothing about a unit coming up.
+                matches!(job_type, "start" | "restart").then(|| unit.to_string())
+            })
+            .collect()
+    }
+
     fn reverse_deps(&self, unit: &str, cfg: &Config) -> Vec<String> {
         // Owned args here (unlike the other methods): the `--property=` flags
         // are built from START_AUTHORISING_PROPERTIES so the property list has
@@ -576,6 +645,13 @@ pub mod testing {
         pub call_log: RefCell<Vec<String>>,
         pub enabled_map: RefCell<HashMap<String, String>>,
         pub active_set: RefCell<HashSet<String>>,
+        /// Units in the `activating` state: not yet active, but part-way
+        /// through starting (services only — targets never report this).
+        pub activating_set: RefCell<HashSet<String>>,
+        /// Units with a queued start job: still `inactive`, but systemd is on
+        /// its way to bringing them up. This is how a boot target looks while
+        /// the units ordered before it are starting.
+        pub queued_start_jobs: RefCell<Vec<String>>,
         /// Canned [`SystemdTrait::reverse_deps`] answers. Flat lists, like the
         /// real implementation: every start-authorising relationship it
         /// queries authorises a start identically, so there is nothing for a
@@ -596,6 +672,8 @@ pub mod testing {
                 call_log: RefCell::new(Vec::new()),
                 enabled_map: RefCell::new(HashMap::new()),
                 active_set: RefCell::new(HashSet::new()),
+                activating_set: RefCell::new(HashSet::new()),
+                queued_start_jobs: RefCell::new(Vec::new()),
                 reverse_deps_map: RefCell::new(HashMap::new()),
                 listed_units: RefCell::new(HashMap::new()),
                 state_map: RefCell::new(HashMap::new()),
@@ -635,6 +713,12 @@ pub mod testing {
         }
         fn is_active(&self, unit: &str, _cfg: &Config) -> bool {
             self.active_set.borrow().contains(unit)
+        }
+        fn is_active_or_activating(&self, unit: &str, _cfg: &Config) -> bool {
+            self.active_set.borrow().contains(unit) || self.activating_set.borrow().contains(unit)
+        }
+        fn pending_start_jobs(&self, _cfg: &Config) -> Vec<String> {
+            self.queued_start_jobs.borrow().clone()
         }
         fn reverse_deps(&self, unit: &str, _cfg: &Config) -> Vec<String> {
             self.reverse_deps_map
