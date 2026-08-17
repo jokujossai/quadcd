@@ -21,7 +21,7 @@ pub use image::{ImagePuller, ImageRef};
 pub use podman::Podman;
 pub use repo::{SyncResult, SyncStatus};
 pub use runner::SyncRunner;
-pub use systemd::{Systemd, SystemdTrait, UnitState};
+pub use systemd::{ActivationState, Systemd, SystemdTrait, UnitState};
 pub use vcs::{GitVcs, UnitChanges, Vcs};
 
 pub(crate) use repo::safe_repo_dir;

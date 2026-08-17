@@ -102,7 +102,13 @@ quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i] [-
 
 Sync pulls unit files from configured git repositories into the data directory, then triggers `systemctl daemon-reload` and restarts changed units with `systemctl restart`.
 
-A changed unit is restarted when it is active, and started when it is inactive but some active unit would itself start it — that is, an active unit declares `Wants=`, `Requires=`, `BindsTo=` or `Upholds=` on it (seen from the changed unit's side as `WantedBy=`, `RequiredBy=`, `BoundBy=` and `UpheldBy=`). This approximates what a reboot would bring up, so a unit stopped by hand is not resurrected.
+A changed unit is restarted when it is active, and started when it is inactive but some unit that is *coming up* would itself start it — that is, that unit declares `Wants=`, `Requires=`, `BindsTo=` or `Upholds=` on it (seen from the changed unit's side as `WantedBy=`, `RequiredBy=`, `BoundBy=` and `UpheldBy=`). This approximates what a reboot would bring up, so a unit stopped by hand is not resurrected.
+
+"Coming up" means running (`active`, or mid-`reload`), `activating`, or holding a queued start job. The last case is what makes the first sync after a reboot work: a target implicitly orders itself after every unit it wants, so until those have started it stays `inactive` with its own start job queued — targets never report `activating`. Whether the boot target is still queued when the first sync runs depends on what else is starting at the time; on a fast boot it may already be `active`. Both readings have to work, and before this only the `active` one did.
+
+A unit that is `activating (auto-restart)` — failed and waiting out `Restart=` — does not count as coming up. It is reported as `activating` but is starting nothing, and a crash-looping unit can sit there indefinitely; treating it as authority would let a failing service restart a unit an operator stopped, once per sync, for as long as it keeps failing.
+
+A changed unit that is *itself* already coming up is left to the job systemd has in flight: sync issues no command, because a restart would tear down a start already underway and a start would only be merged into the same job. Its image is still pre-pulled. Such a unit finishes starting with the configuration systemd loaded when the job was created — the pre-change one — and the new configuration applies the next time something restarts it.
 
 Relationships that never make systemd start a unit do not count: `PartOf=` only propagates stop and restart, `Requisite=` checks a unit rather than starting it, and `Conflicts=` stops it. Socket-, timer- and path-activated services are also left alone while inactive — the point of `TriggeredBy=` activation is that the service starts on demand, and a reboot leaves it inactive until the trigger fires. (One that is already running when its file changes is restarted like any other active unit.)
 
@@ -110,7 +116,7 @@ Relationships that never make systemd start a unit do not count: `PartOf=` only 
 
 Units that stay stopped are left alone, and their container images are not pre-pulled. Images are still pre-pulled for units systemd starts as a dependency of a unit sync starts, such as an `.image` unit required by a `.container`.
 
-A changed template unit (`myapp@.container`) is expanded to the instances systemd has loaded, and each instance is then judged by the same two rules: running instances are restarted, stopped or failed ones are started only when an active unit wants or requires them. A template whose instances all stay stopped is not pre-pulled either.
+A changed template unit (`myapp@.container`) is expanded to the instances systemd has loaded, and each instance is then judged by the same rules: running instances are restarted, stopped or failed ones are started only when something coming up wants or requires them. A template whose instances all stay stopped is not pre-pulled either.
 
 SSH known hosts are stored in the data directory (`.known_hosts` file) to avoid issues with system SSH config under systemd sandboxing. Use `--accept-new-host-keys` for initial setup to automatically accept host keys on first connect, or `-i` for fully interactive SSH (manual host key approval, credential prompts).
 

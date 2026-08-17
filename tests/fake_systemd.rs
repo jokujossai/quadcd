@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use common::{test_config, TestWriter};
 use quadcd::config::Config;
 use quadcd::output::Output;
-use quadcd::sync::{Systemd, SystemdTrait};
+use quadcd::sync::{ActivationState, Systemd, SystemdTrait};
+use rstest::rstest;
 
 fn fake_cmd() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_cmd.sh")
@@ -26,6 +27,38 @@ fn fake_systemd_stdout(stdout: &str, exit_code: i32) -> Systemd {
     Systemd::with_command(fake_cmd().to_str().unwrap())
         .with_env("FAKE_EXIT_CODE", &exit_code.to_string())
         .with_env("FAKE_STDOUT", stdout)
+}
+
+/// Records the argv of every fake systemctl run to a temp file.
+///
+/// The argv-echo trick the `reverse_deps` tests use only works when the method
+/// under test parses whatever lands on stdout. Where the test has to supply
+/// canned output instead, this is how the arguments are pinned.
+struct ArgvLog(tempfile::TempDir);
+
+impl ArgvLog {
+    fn new() -> Self {
+        Self(tempfile::tempdir().unwrap())
+    }
+
+    fn path(&self) -> PathBuf {
+        self.0.path().join("argv")
+    }
+
+    fn systemd(&self, stdout: &str) -> Systemd {
+        Systemd::with_command(fake_cmd().to_str().unwrap())
+            .with_env("FAKE_EXIT_CODE", "0")
+            .with_env("FAKE_STDOUT", stdout)
+            .with_env("FAKE_ARGV_FILE", self.path().to_str().unwrap())
+    }
+
+    fn recorded(&self) -> Vec<String> {
+        std::fs::read_to_string(self.path())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 fn test_cfg(verbose: bool, user_mode: bool) -> Config {
@@ -268,6 +301,184 @@ fn reverse_deps_error_returns_empty() {
     let cfg = test_cfg(false, false);
 
     assert!(sd.reverse_deps("myapp.service", &cfg).is_empty());
+}
+
+// activation_state
+
+#[test]
+fn activation_state_reports_active_state_and_sub_state() {
+    let sd = fake_systemd_stdout("ActiveState=activating\nSubState=start", 0);
+    let cfg = test_cfg(false, false);
+
+    let state = sd.activation_state("myapp.service", &cfg);
+    assert_eq!(state, ActivationState::new("activating", "start"));
+    // `systemctl is-active --quiet` would exit non-zero here; the raw
+    // ActiveState is what separates a unit starting from a failed one.
+    assert!(!state.is_active());
+    assert!(state.is_starting());
+    assert!(!state.is_auto_restarting());
+}
+
+#[test]
+fn activation_state_distinguishes_auto_restart_from_starting() {
+    let sd = fake_systemd_stdout("ActiveState=activating\nSubState=auto-restart", 0);
+    let cfg = test_cfg(false, false);
+
+    let state = sd.activation_state("myapp.service", &cfg);
+    assert!(state.is_starting());
+    assert!(state.is_auto_restarting());
+}
+
+// `systemctl is-active` exits 0 for `reloading` and, since v254, `refreshing`
+// as well as `active`; `is_active` replaced that call and must not narrow it.
+#[rstest]
+#[case::active("active", "running", true)]
+#[case::reloading("reloading", "reload", true)]
+#[case::refreshing("refreshing", "refresh", true)]
+#[case::activating("activating", "start", false)]
+#[case::inactive("inactive", "dead", false)]
+#[case::failed("failed", "failed", false)]
+fn activation_state_is_active_matches_systemctl_is_active(
+    #[case] active_state: &str,
+    #[case] sub_state: &str,
+    #[case] expected: bool,
+) {
+    let sd = fake_systemd_stdout(
+        &format!("ActiveState={active_state}\nSubState={sub_state}"),
+        0,
+    );
+    let cfg = test_cfg(false, false);
+
+    assert_eq!(
+        sd.activation_state("myapp.service", &cfg).is_active(),
+        expected
+    );
+}
+
+#[test]
+fn activation_state_unknown_on_command_failure() {
+    // Valid output, non-zero exit: without the success check the parse would
+    // happily report the unit as active.
+    let sd = fake_systemd_stdout("ActiveState=active\nSubState=running", 1);
+    let cfg = test_cfg(false, false);
+
+    let state = sd.activation_state("myapp.service", &cfg);
+    assert_eq!(state, ActivationState::unknown());
+    assert!(!state.is_active());
+    assert!(!state.is_starting());
+}
+
+#[test]
+fn activation_state_queries_only_the_two_properties() {
+    let argv = ArgvLog::new();
+    let sd = argv.systemd("ActiveState=active\nSubState=running");
+    let cfg = test_cfg(false, true);
+
+    sd.activation_state("myapp.service", &cfg);
+
+    assert_eq!(
+        argv.recorded(),
+        vec!["--user show myapp.service --property=ActiveState --property=SubState".to_string()],
+        "activation_state must stay a two-property query, in the right systemd scope"
+    );
+}
+
+// pending_start_jobs
+
+/// Real `systemctl list-jobs` output, captured from the containerized test
+/// environment while a target waited on a blocked gate service — legend,
+/// blank line, footer and all.
+const LIST_JOBS_DECORATED: &str = "JOB UNIT                  TYPE  STATE\n\
+     208 probe-implicit.target start waiting\n\
+     175 probe-explicit.target start waiting\n\
+     48  quadcd-test.service   start running\n\
+     176 probe-gate1.service   start running\n\
+     209 probe-gate2.service   start running\n\
+     \n\
+     5 jobs listed.";
+
+/// The same listing in the shape production actually sees: `--no-legend` is
+/// always passed, so neither the header nor the footer is printed.
+const LIST_JOBS_PLAIN: &str = "208 probe-implicit.target start waiting\n\
+     175 probe-explicit.target start waiting\n\
+     48  quadcd-test.service   start running";
+
+#[test]
+fn pending_start_jobs_parses_units_with_start_jobs() {
+    let sd = fake_systemd_stdout(LIST_JOBS_PLAIN, 0);
+    let cfg = test_cfg(false, false);
+
+    assert_eq!(
+        sd.pending_start_jobs(&cfg),
+        vec![
+            "probe-implicit.target".to_string(),
+            "probe-explicit.target".to_string(),
+            "quadcd-test.service".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn pending_start_jobs_ignores_legend_and_footer() {
+    // Belt and braces for the decorations `--no-legend` is meant to suppress:
+    // the header's type column reads `TYPE` and the footer line is too short,
+    // so both drop out even if some systemd version prints them anyway.
+    let sd = fake_systemd_stdout(LIST_JOBS_DECORATED, 0);
+    let cfg = test_cfg(false, false);
+
+    assert_eq!(
+        sd.pending_start_jobs(&cfg),
+        vec![
+            "probe-implicit.target".to_string(),
+            "probe-explicit.target".to_string(),
+            "quadcd-test.service".to_string(),
+            "probe-gate1.service".to_string(),
+            "probe-gate2.service".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn pending_start_jobs_excludes_stop_and_reload_jobs() {
+    // A unit on its way *down* must not look like one coming up.
+    let sd = fake_systemd_stdout(
+        "12 boot.target          start   waiting\n\
+         13 multi-user.target    stop    waiting\n\
+         14 app.service          reload  running\n\
+         15 web.service          restart running",
+        0,
+    );
+    let cfg = test_cfg(false, false);
+
+    assert_eq!(
+        sd.pending_start_jobs(&cfg),
+        vec!["boot.target".to_string(), "web.service".to_string()]
+    );
+}
+
+#[test]
+fn pending_start_jobs_empty_on_command_failure() {
+    // Parseable output with a non-zero exit: without the success check these
+    // units would be reported as coming up.
+    let sd = fake_systemd_stdout(LIST_JOBS_PLAIN, 1);
+    let cfg = test_cfg(false, false);
+
+    assert!(sd.pending_start_jobs(&cfg).is_empty());
+}
+
+#[test]
+fn pending_start_jobs_queries_list_jobs_without_legend() {
+    let argv = ArgvLog::new();
+    let sd = argv.systemd(LIST_JOBS_PLAIN);
+    let cfg = test_cfg(false, true);
+
+    sd.pending_start_jobs(&cfg);
+
+    assert_eq!(
+        argv.recorded(),
+        vec!["--user list-jobs --no-legend --no-pager".to_string()],
+        "the parse relies on --no-legend, and user mode must not read the system manager"
+    );
 }
 
 #[test]

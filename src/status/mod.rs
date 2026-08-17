@@ -572,6 +572,7 @@ mod tests {
             .enabled_map
             .borrow_mut()
             .insert("web.service".to_string(), "enabled".to_string());
+        systemd.set_active("web.service");
         let opts = StatusOptions {
             no_fetch: true,
             json: false,
@@ -854,6 +855,9 @@ mod tests {
 
         let vcs = MockVcs::new();
         let systemd = MockSystemd::new();
+        // Running, so the exit code reflects the duplicate warning alone
+        // rather than a service that happens to be down.
+        systemd.set_active("dup.service");
         let opts = StatusOptions {
             no_fetch: true,
             json: false,
