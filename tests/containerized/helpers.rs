@@ -137,6 +137,23 @@ pub fn push_commit(bare: &Path, files: &[(&str, &str)], message: &str) {
     fs::remove_dir_all(&work).unwrap();
 }
 
+/// Push a commit deleting files from a bare repo, via a temporary clone.
+pub fn push_commit_removing(bare: &Path, files: &[&str], message: &str) {
+    let work = bare.with_extension("rm-tmp");
+    if work.exists() {
+        fs::remove_dir_all(&work).unwrap();
+    }
+    run_git(&["clone", bare.to_str().unwrap(), work.to_str().unwrap()]);
+    run_git_in(&work, &["config", "user.email", "test@test.com"]);
+    run_git_in(&work, &["config", "user.name", "Test"]);
+    for filename in files {
+        run_git_in(&work, &["rm", "-q", filename]);
+    }
+    run_git_in(&work, &["commit", "-m", message]);
+    run_git_in(&work, &["push", "origin", "main"]);
+    fs::remove_dir_all(&work).unwrap();
+}
+
 /// Create a bare git repo on a non-default branch with an initial commit.
 pub fn create_bare_repo_on_branch(name: &str, branch: &str, files: &[(&str, &str)]) -> PathBuf {
     let repos = PathBuf::from(repos_dir());

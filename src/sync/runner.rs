@@ -887,13 +887,10 @@ mod tests {
 
         let vcs = MockVcs::new();
         let systemd = MockSystemd::new();
-        systemd
-            .active_set
-            .borrow_mut()
-            .insert("app.service".to_string());
+        systemd.set_active("app.service");
         // The operator stops the unit while the image is downloading.
         let puller = StateChangingPuller::new(&systemd, |systemd| {
-            systemd.active_set.borrow_mut().remove("app.service");
+            systemd.set_state("app.service", "inactive", "dead");
         });
 
         let runner = SyncRunner::new(&cfg, &vcs, &systemd, &puller);
@@ -931,10 +928,7 @@ mod tests {
 
         let vcs = MockVcs::new();
         let systemd = MockSystemd::new();
-        systemd
-            .active_set
-            .borrow_mut()
-            .insert("app.service".to_string());
+        systemd.set_active("app.service");
         systemd
             .reverse_deps_map
             .borrow_mut()
@@ -942,10 +936,7 @@ mod tests {
         // The target that wants `idle.service` comes up during the pull, so
         // the second plan starts it — with its image pulled after all.
         let puller = StateChangingPuller::new(&systemd, |systemd| {
-            systemd
-                .active_set
-                .borrow_mut()
-                .insert("late.target".to_string());
+            systemd.set_active("late.target");
         });
 
         let runner = SyncRunner::new(&cfg, &vcs, &systemd, &puller);

@@ -48,6 +48,62 @@ impl UnitState {
     }
 }
 
+/// A unit's `ActiveState` and `SubState` — the one pair every activation
+/// decision is derived from.
+///
+/// Both come from a single `systemctl show`, so a caller asking several
+/// questions about the same unit ("is it running?", "is it on its way up?")
+/// pays for one query and cannot get answers that contradict each other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationState {
+    pub active_state: String,
+    pub sub_state: String,
+}
+
+impl ActivationState {
+    pub fn new(active_state: &str, sub_state: &str) -> Self {
+        Self {
+            active_state: active_state.to_string(),
+            sub_state: sub_state.to_string(),
+        }
+    }
+
+    /// The state systemctl reports when it cannot say — every predicate below
+    /// answers `false`, which is the conservative reading for all of them.
+    pub fn unknown() -> Self {
+        Self::new("unknown", "unknown")
+    }
+
+    /// Running, by the same rule as `systemctl is-active`.
+    ///
+    /// That command exits 0 for `reloading` as well as `active`, and since
+    /// systemd v254 also for `refreshing` (a soft-reboot mount refresh). A
+    /// unit reloading its configuration is running throughout — dropping
+    /// either state here would silently narrow behaviour against the
+    /// `is-active` call this replaced.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.active_state.as_str(),
+            "active" | "reloading" | "refreshing"
+        )
+    }
+
+    /// Part-way through starting: `ActiveState=activating`.
+    pub fn is_starting(&self) -> bool {
+        self.active_state == "activating"
+    }
+
+    /// Waiting out `Restart=` between attempts: `activating (auto-restart)`.
+    ///
+    /// Reported as `activating`, but nothing is starting — the unit failed and
+    /// systemd is holding it in a restart backoff. A crash-looping unit can sit
+    /// here indefinitely, so it is not evidence that anything it wants belongs
+    /// running.
+    pub fn is_auto_restarting(&self) -> bool {
+        self.is_starting() && self.sub_state == "auto-restart"
+    }
+}
+
 /// `systemctl show` properties naming the units that, when active, would cause
 /// systemd to start this unit.
 ///
@@ -153,35 +209,48 @@ pub trait SystemdTrait {
     /// Return the `is-enabled` state string for a unit (e.g. "enabled", "static",
     /// "disabled", "masked", "generated"). Returns "unknown" on error.
     fn is_enabled(&self, unit: &str, cfg: &Config) -> String;
-    /// Return `true` if the unit is currently active (running).
+    /// Return `true` if the unit is currently active (running), by
+    /// `systemctl is-active`'s rule — which also covers `reloading` and, since
+    /// systemd v254, `refreshing`. [`ActivationState::is_active`] answers the
+    /// same question from an already-fetched state.
     fn is_active(&self, unit: &str, cfg: &Config) -> bool;
-    /// Return `true` if the unit is active **or** still activating.
+    /// Return the unit's `ActiveState` and `SubState`.
     ///
-    /// `systemctl is-active --quiet` exits non-zero for `activating`, so it
-    /// cannot answer this. A service that is still starting — `Type=oneshot`
-    /// mid-`ExecStart`, `Type=notify` before its ready notification, or one
-    /// waiting out `Restart=` in `activating (auto-restart)` — is on its way
-    /// up and will pull in whatever it wants or requires.
+    /// Every activation decision is derived from this pair, so one query
+    /// answers all of them for a unit. `systemctl is-active` cannot stand in:
+    /// it collapses `activating` and `failed` into the same non-zero exit, and
+    /// says nothing about the sub-state that separates a unit genuinely
+    /// starting from one idling in `auto-restart` backoff.
     ///
-    /// Note this does **not** cover a boot target waiting on its queued jobs:
-    /// target units only ever have the states `inactive` and `active`, never
-    /// `activating`. See [`SystemdTrait::pending_start_jobs`].
-    fn is_active_or_activating(&self, unit: &str, cfg: &Config) -> bool;
+    /// Defaults to projecting [`SystemdTrait::show_state`], so implementors
+    /// need not add anything; [`Systemd`] overrides it with a narrower
+    /// `systemctl show` that asks for just these two properties.
+    fn activation_state(&self, unit: &str, cfg: &Config) -> ActivationState {
+        let state = self.show_state(unit, cfg);
+        ActivationState {
+            active_state: state.active_state,
+            sub_state: state.sub_state,
+        }
+    }
     /// Return the units that have a queued start (or restart) job.
     ///
-    /// This is the state a boot target is in while the units ordered before it
-    /// are still coming up: `ActiveState=inactive`, `SubState=dead`, and a
-    /// pending job. A target reaches `active` only once every job queued with
-    /// it has finished — and because targets implicitly order themselves after
-    /// the units they want, `multi-user.target` / `default.target` sit there
-    /// for the whole early-boot window in which quadcd's first sync runs. Such
-    /// a unit is indistinguishable from a stopped one by state alone, but the
-    /// queued job says systemd is on its way to bringing it up.
+    /// A unit whose start job is queued but has not run yet is still
+    /// `ActiveState=inactive`, `SubState=dead` — indistinguishable from a
+    /// stopped unit by state alone. This is how a target looks while the units
+    /// ordered before it are starting: it implicitly orders itself after
+    /// everything it wants, so its own job cannot complete until theirs have.
     ///
     /// Read from `systemctl list-jobs` rather than per-unit
-    /// `show --property=Job`: the unit property carries only the job id, not
-    /// its type, and a *stop* job — a target on its way down during shutdown —
-    /// must not be mistaken for one coming up. Empty on error.
+    /// `show --property=Job` because that property carries only the job id.
+    /// The type is what matters: a queued `stop` job means the opposite of a
+    /// queued `start`, and only `list-jobs` reports it.
+    ///
+    /// Job *types* are filtered, not job semantics: a reboot enqueues a
+    /// **start** job for `shutdown.target`, and this returns it like any
+    /// other. The residual cost is small — systemd refuses a start it
+    /// considers destructive for `DefaultDependencies=yes` units, so a unit
+    /// wanted by a shutdown target yields a wasted image pull and a failed
+    /// `systemctl start` in the log, not a running unit. Empty on error.
     fn pending_start_jobs(&self, cfg: &Config) -> Vec<String>;
     /// Return the units whose activation would make systemd start this unit:
     /// the reverse dependencies `WantedBy`, `RequiredBy`, `BoundBy` and
@@ -404,16 +473,40 @@ impl SystemdTrait for Systemd {
             .is_ok_and(|c| c.success())
     }
 
-    fn is_active_or_activating(&self, unit: &str, cfg: &Config) -> bool {
-        // `systemctl is-active --quiet` cannot answer this: it exits non-zero
-        // for a unit in the `activating` state. `systemctl show` reports the
-        // raw `ActiveState` instead, and reusing `show_state` keeps this to a
-        // single systemctl invocation with one parser rather than a
-        // near-duplicate `show --property=ActiveState --value` call.
-        matches!(
-            self.show_state(unit, cfg).active_state.as_str(),
-            "active" | "activating"
-        )
+    fn activation_state(&self, unit: &str, cfg: &Config) -> ActivationState {
+        // Overrides the trait's `show_state`-based default with a two-property
+        // query. `show_state` also asks for `NeedDaemonReload`, which makes PID
+        // 1 stat the fragment and rescan the drop-in directories on every read
+        // — work worth doing for the status report it exists for, but not for
+        // the two strings the planner needs per unit.
+        let mut args = Self::user_args(cfg);
+        args.extend([
+            "show",
+            unit,
+            "--property=ActiveState",
+            "--property=SubState",
+        ]);
+
+        let Ok(capture) = self.exec().args(args.iter().copied()).capture() else {
+            return ActivationState::unknown();
+        };
+        if !capture.success() {
+            return ActivationState::unknown();
+        }
+
+        // Parsed as `KEY=value` lines rather than with `--value`: the bare
+        // values arrive in systemd's own property order with nothing to say
+        // which line is which.
+        let stdout = String::from_utf8_lossy(&capture.stdout);
+        let mut state = ActivationState::unknown();
+        for line in stdout.lines() {
+            match line.split_once('=') {
+                Some(("ActiveState", val)) => state.active_state = val.to_string(),
+                Some(("SubState", val)) => state.sub_state = val.to_string(),
+                _ => {}
+            }
+        }
+        state
     }
 
     fn pending_start_jobs(&self, cfg: &Config) -> Vec<String> {
@@ -633,7 +726,7 @@ mod tests {
 pub mod testing {
     use super::*;
     use std::cell::RefCell;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
 
     pub struct MockSystemd {
         pub reload_called: RefCell<bool>,
@@ -644,10 +737,16 @@ pub mod testing {
         /// `"restart:bar"`, …) so tests can assert ordering across methods.
         pub call_log: RefCell<Vec<String>>,
         pub enabled_map: RefCell<HashMap<String, String>>,
-        pub active_set: RefCell<HashSet<String>>,
-        /// Units in the `activating` state: not yet active, but part-way
-        /// through starting (services only — targets never report this).
-        pub activating_set: RefCell<HashSet<String>>,
+        /// Every unit's state, as the one `ActiveState`/`SubState` pair systemd
+        /// would report. `is_active`, `activation_state` and `show_state` all
+        /// read this, so the mock cannot express a combination systemd cannot
+        /// produce — a unit that is `is_active() == false` while `show_state()`
+        /// says `active`, say, which would hide any mismatch between the
+        /// predicates and `systemctl is-active`.
+        ///
+        /// Units absent from the map are `inactive (dead)`; the `set_*` helpers
+        /// below are the intended way to populate it.
+        pub state_map: RefCell<HashMap<String, UnitState>>,
         /// Units with a queued start job: still `inactive`, but systemd is on
         /// its way to bringing them up. This is how a boot target looks while
         /// the units ordered before it are starting.
@@ -659,7 +758,6 @@ pub mod testing {
         /// entry are indistinguishable by construction.
         pub reverse_deps_map: RefCell<HashMap<String, Vec<String>>>,
         pub listed_units: RefCell<HashMap<String, Vec<String>>>,
-        pub state_map: RefCell<HashMap<String, UnitState>>,
     }
 
     impl MockSystemd {
@@ -671,12 +769,85 @@ pub mod testing {
                 stopped: RefCell::new(Vec::new()),
                 call_log: RefCell::new(Vec::new()),
                 enabled_map: RefCell::new(HashMap::new()),
-                active_set: RefCell::new(HashSet::new()),
-                activating_set: RefCell::new(HashSet::new()),
+                state_map: RefCell::new(HashMap::new()),
                 queued_start_jobs: RefCell::new(Vec::new()),
                 reverse_deps_map: RefCell::new(HashMap::new()),
                 listed_units: RefCell::new(HashMap::new()),
-                state_map: RefCell::new(HashMap::new()),
+            }
+        }
+
+        /// Set a unit's `ActiveState`/`SubState`, leaving the rest of its
+        /// [`UnitState`] at the defaults.
+        pub fn set_state(&self, unit: &str, active_state: &str, sub_state: &str) {
+            let mut state = UnitState {
+                active_state: active_state.to_string(),
+                sub_state: sub_state.to_string(),
+                result: "success".to_string(),
+                need_daemon_reload: false,
+                n_restarts: 0,
+                active_enter_timestamp_monotonic: None,
+                fragment_path: None,
+            };
+            if let Some(existing) = self.state_map.borrow().get(unit) {
+                state.result = existing.result.clone();
+                state.need_daemon_reload = existing.need_daemon_reload;
+                state.n_restarts = existing.n_restarts;
+                state.active_enter_timestamp_monotonic = existing.active_enter_timestamp_monotonic;
+                state.fragment_path = existing.fragment_path.clone();
+            }
+            self.state_map.borrow_mut().insert(unit.to_string(), state);
+        }
+
+        /// `active (running)` — the unit is up.
+        pub fn set_active(&self, unit: &str) {
+            self.set_state(unit, "active", "running");
+        }
+
+        /// `activating (start)` — part-way through starting.
+        pub fn set_activating(&self, unit: &str) {
+            self.set_state(unit, "activating", "start");
+        }
+
+        /// `reloading (reload)` — running, reloading its configuration.
+        /// `systemctl is-active` exits 0 here.
+        pub fn set_reloading(&self, unit: &str) {
+            self.set_state(unit, "reloading", "reload");
+        }
+
+        /// `activating (auto-restart)` — failed and waiting out `Restart=`.
+        pub fn set_auto_restarting(&self, unit: &str) {
+            self.set_state(unit, "activating", "auto-restart");
+        }
+
+        /// Queue a start job for a unit, as systemd would while the unit waits
+        /// for whatever is ordered before it.
+        pub fn queue_start_job(&self, unit: &str) {
+            self.queued_start_jobs.borrow_mut().push(unit.to_string());
+        }
+
+        fn state_of(&self, unit: &str) -> UnitState {
+            self.state_map
+                .borrow()
+                .get(unit)
+                .cloned()
+                .unwrap_or_else(|| UnitState {
+                    active_state: "inactive".to_string(),
+                    sub_state: "dead".to_string(),
+                    result: "success".to_string(),
+                    need_daemon_reload: false,
+                    n_restarts: 0,
+                    active_enter_timestamp_monotonic: None,
+                    fragment_path: None,
+                })
+        }
+
+        /// Bring a unit up the way a successful `systemctl start`/`restart`
+        /// does, so post-activation state reads reflect the actions taken.
+        /// A state a test pinned explicitly wins — that is how a unit that
+        /// fails to come up is expressed.
+        fn record_activation(&self, unit: &str) {
+            if !self.state_map.borrow().contains_key(unit) {
+                self.set_active(unit);
             }
         }
     }
@@ -690,18 +861,21 @@ pub mod testing {
             self.restarted.borrow_mut().extend_from_slice(units);
             for u in units {
                 self.call_log.borrow_mut().push(format!("restart:{u}"));
+                self.record_activation(u);
             }
         }
         fn start(&self, units: &[String], _cfg: &Config) {
             self.started.borrow_mut().extend_from_slice(units);
             for u in units {
                 self.call_log.borrow_mut().push(format!("start:{u}"));
+                self.record_activation(u);
             }
         }
         fn stop(&self, units: &[String], _cfg: &Config) {
             self.stopped.borrow_mut().extend_from_slice(units);
             for u in units {
                 self.call_log.borrow_mut().push(format!("stop:{u}"));
+                self.set_state(u, "inactive", "dead");
             }
         }
         fn is_enabled(&self, unit: &str, _cfg: &Config) -> String {
@@ -712,12 +886,22 @@ pub mod testing {
                 .unwrap_or_else(|| "disabled".to_string())
         }
         fn is_active(&self, unit: &str, _cfg: &Config) -> bool {
-            self.active_set.borrow().contains(unit)
+            // Derived from the same state the other readers use, and by the
+            // same rule as `systemctl is-active` — so `reloading` counts here
+            // exactly as it does in production.
+            self.call_log.borrow_mut().push(format!("is-active:{unit}"));
+            let state = self.state_of(unit);
+            ActivationState::new(&state.active_state, &state.sub_state).is_active()
         }
-        fn is_active_or_activating(&self, unit: &str, _cfg: &Config) -> bool {
-            self.active_set.borrow().contains(unit) || self.activating_set.borrow().contains(unit)
+        fn activation_state(&self, unit: &str, _cfg: &Config) -> ActivationState {
+            // Logged so tests can count queries: each of these is one
+            // `systemctl show` against PID 1 in production.
+            self.call_log.borrow_mut().push(format!("state:{unit}"));
+            let state = self.state_of(unit);
+            ActivationState::new(&state.active_state, &state.sub_state)
         }
         fn pending_start_jobs(&self, _cfg: &Config) -> Vec<String> {
+            self.call_log.borrow_mut().push("list-jobs".to_string());
             self.queued_start_jobs.borrow().clone()
         }
         fn reverse_deps(&self, unit: &str, _cfg: &Config) -> Vec<String> {
@@ -735,19 +919,7 @@ pub mod testing {
                 .unwrap_or_default()
         }
         fn show_state(&self, unit: &str, _cfg: &Config) -> UnitState {
-            self.state_map
-                .borrow()
-                .get(unit)
-                .cloned()
-                .unwrap_or_else(|| UnitState {
-                    active_state: "active".to_string(),
-                    sub_state: "running".to_string(),
-                    result: "success".to_string(),
-                    need_daemon_reload: false,
-                    n_restarts: 0,
-                    active_enter_timestamp_monotonic: None,
-                    fragment_path: None,
-                })
+            self.state_of(unit)
         }
     }
 }

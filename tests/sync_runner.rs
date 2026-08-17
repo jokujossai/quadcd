@@ -43,10 +43,7 @@ fn run_once_syncs_and_restarts() {
         "app.service".to_string(),
         vec!["default.target".to_string()],
     );
-    systemd
-        .active_set
-        .borrow_mut()
-        .insert("default.target".to_string());
+    systemd.set_active("default.target");
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");
@@ -110,10 +107,7 @@ fn run_once_pre_pulls_changed_container_images() {
         "app.service".to_string(),
         vec!["default.target".to_string()],
     );
-    systemd
-        .active_set
-        .borrow_mut()
-        .insert("default.target".to_string());
+    systemd.set_active("default.target");
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");
@@ -148,10 +142,7 @@ fn run_once_skips_pre_pull_for_units_that_stay_stopped() {
     // `idle.service` is inactive and wanted only by an inactive unit, so it
     // stays stopped — pulling its image would waste network and disk.
     let systemd = MockSystemd::new();
-    systemd
-        .active_set
-        .borrow_mut()
-        .insert("app.service".to_string());
+    systemd.set_active("app.service");
     systemd.reverse_deps_map.borrow_mut().insert(
         "idle.service".to_string(),
         vec!["stopped.target".to_string()],
@@ -229,10 +220,7 @@ fn run_once_pre_pulls_image_unit_required_by_a_starting_container() {
     // systemd starts it as part of that transaction, so its image still has
     // to be pre-pulled.
     let systemd = MockSystemd::new();
-    systemd
-        .active_set
-        .borrow_mut()
-        .insert("default.target".to_string());
+    systemd.set_active("default.target");
     systemd.reverse_deps_map.borrow_mut().insert(
         "web.service".to_string(),
         vec!["default.target".to_string()],
@@ -356,10 +344,7 @@ fn run_once_sync_only_skips_reload_and_restart() {
         "app.service".to_string(),
         vec!["default.target".to_string()],
     );
-    systemd
-        .active_set
-        .borrow_mut()
-        .insert("default.target".to_string());
+    systemd.set_active("default.target");
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");
@@ -535,18 +520,12 @@ fn run_once_stops_deleted_units_before_reload() {
         deleted: vec!["gone.container".to_string()],
     };
     let systemd = MockSystemd::new();
-    systemd
-        .active_set
-        .borrow_mut()
-        .insert("gone.service".to_string());
+    systemd.set_active("gone.service");
     systemd.reverse_deps_map.borrow_mut().insert(
         "web.service".to_string(),
         vec!["default.target".to_string()],
     );
-    systemd
-        .active_set
-        .borrow_mut()
-        .insert("default.target".to_string());
+    systemd.set_active("default.target");
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");
@@ -598,10 +577,7 @@ fn run_once_sync_only_does_not_stop_deleted() {
         deleted: vec!["gone.container".to_string()],
     };
     let systemd = MockSystemd::new();
-    systemd
-        .active_set
-        .borrow_mut()
-        .insert("gone.service".to_string());
+    systemd.set_active("gone.service");
     let image_puller = MockImagePuller::new();
 
     let repo_dir = tmp.path().join("myrepo");

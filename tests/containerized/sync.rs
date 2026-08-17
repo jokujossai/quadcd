@@ -729,3 +729,107 @@ fn sync_starts_unit_wanted_by_target_with_queued_job() {
         "holdme.service should have been started, stderr: {stderr}"
     );
 }
+
+/// Releases the blocked unit of [`sync_stops_deleted_unit_that_is_still_starting`].
+struct StartingUnitGuard {
+    release_marker: String,
+}
+
+impl Drop for StartingUnitGuard {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.release_marker, "release\n");
+        let _ = systemctl(&["stop", "slowstart.service"]);
+        let _ = fs::remove_file(&self.release_marker);
+    }
+}
+
+/// A unit caught part-way through starting must be stopped when its file is
+/// deleted.
+///
+/// `systemctl stop` has to run before `daemon-reload`, because afterwards
+/// systemd no longer knows the unit and cannot reach whatever it started. A
+/// unit that is `activating` when the sync runs has a process (and, for a
+/// `.container`, soon a container) behind it, but `systemctl is-active --quiet`
+/// exits non-zero for it — so it used to slip through and finish starting into
+/// an orphan.
+///
+/// Deterministic: the unit's `ExecStart` blocks on a marker file, so it stays
+/// `activating` for exactly as long as the test needs.
+#[test]
+#[ignore]
+fn sync_stops_deleted_unit_that_is_still_starting() {
+    let _ctx = SyncTestContext::new();
+
+    let uid = unsafe { libc::getuid() };
+    let release_marker = format!("/tmp/quadcd-slowstart-release-{uid}");
+    let _guard = StartingUnitGuard {
+        release_marker: release_marker.clone(),
+    };
+    let _ = fs::remove_file(&release_marker);
+
+    // `Type=oneshot` reports `activating (start)` for as long as ExecStart
+    // runs. No `[Install]`, so sync will not start it — the test does.
+    let unit = format!(
+        "[Service]\nType=oneshot\nRemainAfterExit=yes\nTimeoutStartSec=300\n\
+         ExecStart=/bin/sh -c 'while [ ! -e {release_marker} ]; do sleep 0.1; done'\n"
+    );
+    let bare = create_bare_repo(
+        "slowstart",
+        &[
+            ("slowstart.service", unit.as_str()),
+            (
+                "keep.service",
+                "[Service]\nType=oneshot\nExecStart=/bin/true\n",
+            ),
+        ],
+    );
+    fs::write(
+        config_path(),
+        format!(
+            "[repositories.slowstart]\nurl = \"{}\"\ninterval = \"60s\"\n",
+            bare.to_str().unwrap()
+        ),
+    )
+    .unwrap();
+
+    let mut args: Vec<&str> = vec!["sync", "-v"];
+    if is_user_mode() {
+        args.push("--user");
+    }
+    let output = run_quadcd(&args);
+    assert!(
+        output.status.success(),
+        "initial sync should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Start it and let it block in ExecStart.
+    assert!(
+        systemctl(&["start", "--no-block", "slowstart.service"]),
+        "failed to start slowstart.service"
+    );
+    wait_until(
+        Duration::from_secs(30),
+        "slowstart.service to be activating",
+        || active_state("slowstart.service") == "activating",
+    );
+
+    // Delete the file from the repo and sync again.
+    push_commit_removing(&bare, &["slowstart.service"], "delete slowstart");
+
+    let output = run_quadcd(&args);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "second sync should succeed, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("Stopping deleted units: slowstart.service"),
+        "sync should stop a deleted unit that is still starting, stderr: {stderr}"
+    );
+    assert_ne!(
+        active_state("slowstart.service"),
+        "activating",
+        "slowstart.service should no longer be starting, stderr: {stderr}"
+    );
+}
