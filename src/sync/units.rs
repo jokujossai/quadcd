@@ -431,8 +431,15 @@ impl<'a> ActiveStates<'a> {
     /// anything, and a crash-looping one can sit there indefinitely. Treating
     /// it as authority would let a failing service resurrect a unit an operator
     /// stopped, once per sync, forever.
+    ///
+    /// Inlines [`Self::is_coming_up`] against one fetched state rather than
+    /// calling it, which would fetch the same state a second time.
     fn authorises_start(&mut self, unit: &str, cfg: &Config) -> bool {
-        !self.state(unit, cfg).is_auto_restarting() && self.is_coming_up(unit, cfg)
+        let state = self.state(unit, cfg);
+        if state.is_auto_restarting() {
+            return false;
+        }
+        state.is_active() || state.is_starting() || self.has_queued_start_job(unit, cfg)
     }
 }
 

@@ -217,18 +217,23 @@ fn is_enabled_error_returns_unknown() {
 }
 
 // is_active
+//
+// `SystemdTrait::is_active` defaults to projecting `activation_state`, so its
+// predicate behaviour (reloading/refreshing counting as active, etc.) is
+// already covered by `activation_state_is_active_matches_systemctl_is_active`
+// below. These two only pin that the default wiring itself works end to end.
 
 #[test]
-fn is_active_success() {
-    let sd = fake_systemd(0);
+fn is_active_true_when_active() {
+    let sd = fake_systemd_stdout("ActiveState=active\nSubState=running", 0);
     let cfg = test_cfg(false, false);
 
     assert!(sd.is_active("myapp.service", &cfg));
 }
 
 #[test]
-fn is_active_failure() {
-    let sd = fake_systemd(3); // systemctl is-active returns 3 for inactive
+fn is_active_false_on_command_failure() {
+    let sd = fake_systemd_stdout("ActiveState=active\nSubState=running", 3);
     let cfg = test_cfg(false, false);
 
     assert!(!sd.is_active("myapp.service", &cfg));

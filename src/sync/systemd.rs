@@ -211,9 +211,13 @@ pub trait SystemdTrait {
     fn is_enabled(&self, unit: &str, cfg: &Config) -> String;
     /// Return `true` if the unit is currently active (running), by
     /// `systemctl is-active`'s rule — which also covers `reloading` and, since
-    /// systemd v254, `refreshing`. [`ActivationState::is_active`] answers the
-    /// same question from an already-fetched state.
-    fn is_active(&self, unit: &str, cfg: &Config) -> bool;
+    /// systemd v254, `refreshing`.
+    ///
+    /// Defaults to projecting [`SystemdTrait::activation_state`], the same
+    /// backward-compat pattern that method uses for [`SystemdTrait::show_state`].
+    fn is_active(&self, unit: &str, cfg: &Config) -> bool {
+        self.activation_state(unit, cfg).is_active()
+    }
     /// Return the unit's `ActiveState` and `SubState`.
     ///
     /// Every activation decision is derived from this pair, so one query
@@ -319,6 +323,44 @@ impl Systemd {
         } else {
             vec![]
         }
+    }
+
+    /// Run `systemctl show <unit> --property=<p>...` for `properties` and
+    /// parse the `KEY=value` lines it prints. `None` on a failed or
+    /// non-zero-exit invocation — shared by [`SystemdTrait::activation_state`]
+    /// and [`SystemdTrait::show_state`], which differ only in which
+    /// properties they ask for and which struct they fold the pairs into.
+    ///
+    /// Parsed as `KEY=value` lines rather than with `--value`: the bare
+    /// values arrive in systemd's own property order with nothing to say
+    /// which line is which.
+    fn show_properties(
+        &self,
+        unit: &str,
+        properties: &[&str],
+        cfg: &Config,
+    ) -> Option<Vec<(String, String)>> {
+        let mut args: Vec<String> = Self::user_args(cfg)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        args.push("show".to_string());
+        args.push(unit.to_string());
+        args.extend(properties.iter().map(|p| format!("--property={p}")));
+
+        let capture = self.exec().args(&args).capture().ok()?;
+        if !capture.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&capture.stdout)
+                .lines()
+                .filter_map(|line| {
+                    line.split_once('=')
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                })
+                .collect(),
+        )
     }
 }
 
@@ -463,46 +505,20 @@ impl SystemdTrait for Systemd {
         }
     }
 
-    fn is_active(&self, unit: &str, cfg: &Config) -> bool {
-        let mut args = Self::user_args(cfg);
-        args.extend(["is-active", "--quiet", unit]);
-
-        self.exec()
-            .args(args.iter().copied())
-            .capture()
-            .is_ok_and(|c| c.success())
-    }
-
     fn activation_state(&self, unit: &str, cfg: &Config) -> ActivationState {
         // Overrides the trait's `show_state`-based default with a two-property
         // query. `show_state` also asks for `NeedDaemonReload`, which makes PID
         // 1 stat the fragment and rescan the drop-in directories on every read
         // — work worth doing for the status report it exists for, but not for
         // the two strings the planner needs per unit.
-        let mut args = Self::user_args(cfg);
-        args.extend([
-            "show",
-            unit,
-            "--property=ActiveState",
-            "--property=SubState",
-        ]);
-
-        let Ok(capture) = self.exec().args(args.iter().copied()).capture() else {
+        let Some(props) = self.show_properties(unit, &["ActiveState", "SubState"], cfg) else {
             return ActivationState::unknown();
         };
-        if !capture.success() {
-            return ActivationState::unknown();
-        }
-
-        // Parsed as `KEY=value` lines rather than with `--value`: the bare
-        // values arrive in systemd's own property order with nothing to say
-        // which line is which.
-        let stdout = String::from_utf8_lossy(&capture.stdout);
         let mut state = ActivationState::unknown();
-        for line in stdout.lines() {
-            match line.split_once('=') {
-                Some(("ActiveState", val)) => state.active_state = val.to_string(),
-                Some(("SubState", val)) => state.sub_state = val.to_string(),
+        for (key, val) in props {
+            match key.as_str() {
+                "ActiveState" => state.active_state = val,
+                "SubState" => state.sub_state = val,
                 _ => {}
             }
         }
@@ -578,50 +594,37 @@ impl SystemdTrait for Systemd {
     }
 
     fn show_state(&self, unit: &str, cfg: &Config) -> UnitState {
-        let mut args = Self::user_args(cfg);
-        args.extend([
-            "show",
+        let Some(props) = self.show_properties(
             unit,
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=Result",
-            "--property=NeedDaemonReload",
-            "--property=NRestarts",
-            "--property=ActiveEnterTimestampMonotonic",
-            "--property=FragmentPath",
-        ]);
-
-        let Ok(capture) = self.exec().args(args.iter().copied()).capture() else {
+            &[
+                "ActiveState",
+                "SubState",
+                "Result",
+                "NeedDaemonReload",
+                "NRestarts",
+                "ActiveEnterTimestampMonotonic",
+                "FragmentPath",
+            ],
+            cfg,
+        ) else {
             return UnitState::unknown();
         };
-        if !capture.success() {
-            return UnitState::unknown();
-        }
-
-        let stdout = String::from_utf8_lossy(&capture.stdout);
         let mut state = UnitState::unknown();
-        for line in stdout.lines() {
-            if let Some((key, val)) = line.split_once('=') {
-                match key {
-                    "ActiveState" => state.active_state = val.to_string(),
-                    "SubState" => state.sub_state = val.to_string(),
-                    "Result" => state.result = val.to_string(),
-                    "NeedDaemonReload" => state.need_daemon_reload = val == "yes",
-                    "NRestarts" => state.n_restarts = val.parse().unwrap_or(0),
-                    "ActiveEnterTimestampMonotonic" => {
-                        state.active_enter_timestamp_monotonic =
-                            val.parse::<u64>().ok().filter(|v| *v > 0);
-                    }
-
-                    "FragmentPath" => {
-                        state.fragment_path = if val.is_empty() {
-                            None
-                        } else {
-                            Some(val.to_string())
-                        };
-                    }
-                    _ => {}
+        for (key, val) in props {
+            match key.as_str() {
+                "ActiveState" => state.active_state = val,
+                "SubState" => state.sub_state = val,
+                "Result" => state.result = val,
+                "NeedDaemonReload" => state.need_daemon_reload = val == "yes",
+                "NRestarts" => state.n_restarts = val.parse().unwrap_or(0),
+                "ActiveEnterTimestampMonotonic" => {
+                    state.active_enter_timestamp_monotonic =
+                        val.parse::<u64>().ok().filter(|v| *v > 0);
                 }
+                "FragmentPath" => {
+                    state.fragment_path = if val.is_empty() { None } else { Some(val) };
+                }
+                _ => {}
             }
         }
         state
@@ -884,14 +887,6 @@ pub mod testing {
                 .get(unit)
                 .cloned()
                 .unwrap_or_else(|| "disabled".to_string())
-        }
-        fn is_active(&self, unit: &str, _cfg: &Config) -> bool {
-            // Derived from the same state the other readers use, and by the
-            // same rule as `systemctl is-active` — so `reloading` counts here
-            // exactly as it does in production.
-            self.call_log.borrow_mut().push(format!("is-active:{unit}"));
-            let state = self.state_of(unit);
-            ActivationState::new(&state.active_state, &state.sub_state).is_active()
         }
         fn activation_state(&self, unit: &str, _cfg: &Config) -> ActivationState {
             // Logged so tests can count queries: each of these is one
