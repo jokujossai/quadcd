@@ -3,7 +3,7 @@ exclude = ["ci-tools"]
 
 [package]
 name = "quadcd"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.74"
 description = "A systemd generator and CD tool for Quadlet containers and systemd units"
