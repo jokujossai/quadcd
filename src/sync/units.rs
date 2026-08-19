@@ -114,8 +114,18 @@ impl ActivationPlan {
 /// updated unit files. Each changed unit is inspected:
 /// - **Active** units: `restart` — a running unit whose file changed keeps
 ///   running with the new configuration.
-/// - Units **already coming up** (`activating`, or holding a queued start
-///   job): left to the job systemd already has in flight. No command is
+/// - **Crash-looping** units (`activating (auto-restart)`): also `restart`.
+///   Unlike the same state on a *dependant* — which does not authorise
+///   starting some other unit, since a crash loop is not evidence anything
+///   belongs running (see `ActiveStates::authorises_start`) — this is the
+///   unit's own change: no job is actually in flight, since systemd already
+///   gave up on the last attempt and is waiting out `Restart=`, so nothing is
+///   interrupted by restarting now, and doing so applies the new
+///   configuration immediately instead of leaving it stranded until whichever
+///   future backoff attempt happens to land, if the crash loop does not
+///   exhaust `StartLimitBurst` first.
+/// - Units **already coming up** (genuinely `activating`, or holding a queued
+///   start job): left to the job systemd already has in flight. No command is
 ///   issued, but they are recorded as activated so their images are still
 ///   pre-pulled.
 /// - **Inactive** units: `start` only if some unit whose own activation would
@@ -300,10 +310,25 @@ fn plan_unit(
         return Action::Restart;
     }
 
-    // Already coming up under a job systemd has in flight — `activating`, or
-    // still `inactive` with a queued start job. Nothing is issued: `restart`
-    // would abort a start already underway (tearing down a container that is
-    // just coming up), and `start` would only be merged into the same job. It
+    // Crash-looping in its own `Restart=` backoff: reported as `activating`,
+    // like a unit genuinely coming up, but no job is actually in flight — the
+    // last attempt already failed and systemd is waiting out `Restart=`
+    // before trying again. Nothing is interrupted by restarting now, and
+    // doing so applies the new configuration immediately rather than leaving
+    // it stranded for a future attempt that may never come (a `git diff`
+    // between two commits reports no change once this file has already been
+    // seen once, so nothing revisits a unit sync did not act on today).
+    if active.state(unit, cfg).is_auto_restarting() {
+        plan.to_restart.push(unit.to_string());
+        mark_activating(plan, templates, unit);
+        return Action::Restart;
+    }
+
+    // Already coming up under a job systemd has in flight — genuinely
+    // `activating`, or still `inactive` with a queued start job. Nothing is
+    // issued: `restart` would abort a start already underway (tearing down a
+    // container that is just coming up), and `start` would only be merged
+    // into the same job. It
     // is recorded as activated regardless, because it *will* be running, and
     // that is what decides whether its image is pre-pulled — otherwise a
     // multi-GB pull lands inline inside `podman run`.
@@ -1153,6 +1178,24 @@ mod tests {
 
         assert_eq!(systemd.restarted.borrow().as_slice(), &["app.service"]);
         assert!(systemd.started.borrow().is_empty());
+    }
+
+    #[test]
+    fn activate_restarts_a_changed_unit_that_is_itself_auto_restarting() {
+        // Unlike the same state on a *dependant* (see the test below), a
+        // crash-looping changed unit is not left `AlreadyStarting`: no job is
+        // actually in flight, so restarting now is safe and is the only way
+        // the new configuration is ever applied to it.
+        let systemd = MockSystemd::new();
+        systemd.set_auto_restarting("app.service");
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = plan_activation(&systemd, &["app.container".into()], &cfg);
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert_eq!(systemd.restarted.borrow().as_slice(), &["app.service"]);
+        assert!(systemd.started.borrow().is_empty());
+        assert!(plan.activates_file("app.container"));
     }
 
     #[test]
