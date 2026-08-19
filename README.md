@@ -84,6 +84,20 @@ Generator mode is also activated automatically when:
 - The binary is invoked via a symlink whose basename is not `quadcd` (e.g., `podman-user-generator` or `podman-system-generator`).
 - `SYSTEMD_SCOPE` is set and the positional arguments look like a generator invocation (1 or 3 args, first is an existing directory).
 
+#### `[Install]` Sections in Plain Systemd Units
+
+Generated units cannot be enabled with `systemctl enable`, so an `[Install]` section alone would never make a plain `.service`, `.timer` or `.socket` start at boot. The generator therefore materialises the section itself, the same way Quadlet does for its own units: each target in `WantedBy=` gets a `<target>.wants/<unit>` symlink in the generator directory, and each target in `RequiredBy=` gets a `<target>.requires/<unit>` one. The links are relative, pointing at the installed unit next to the directory.
+
+```ini
+# backup.timer
+[Install]
+WantedBy=timers.target
+```
+
+generates `timers.target.wants/backup.timer`, which is what pulls the timer in at boot — and, because sync starts an inactive changed unit when something that wants it is coming up (see [Sync](#sync-git-based-continuous-deployment) below), what lets a first sync start it too.
+
+Values are space-separated and accumulate across repeated assignments; an empty assignment (`WantedBy=`) resets the list, following systemd. Other `[Install]` directives — `Alias=`, `Also=`, `DefaultInstance=` — are not acted on. Quadlet units are unaffected: Podman's generator handles their `[Install]` sections.
+
 ### Sync (git-based continuous deployment)
 
 ```sh
