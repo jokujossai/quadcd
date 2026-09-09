@@ -93,7 +93,7 @@ After pulling, sync runs `daemon-reload` and handles each changed unit the way a
 - **Template**: each loaded instance follows the rules above.
 - **Deleted**: stopped before `daemon-reload`.
 
-Images are pre-pulled only for units that will be running.
+Images are pre-pulled only for units that will be running, following the unit's pull policy (`Pull=` in `.container`, `Policy=` in `.image`).
 
 ## Unit settings: `[X-QuadCD]`
 

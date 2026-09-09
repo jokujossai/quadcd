@@ -15,6 +15,43 @@ pub struct ImageRef {
     pub tls_verify: Option<bool>,
     /// Extra arguments forwarded verbatim to `podman pull`.
     pub podman_args: Vec<String>,
+    /// Passed as `podman pull --policy`, so podman decides whether to pull.
+    pub pull_policy: PullPolicy,
+}
+
+/// Pull policy from `Pull=` (`.container`) or `Policy=` (`.image`).
+/// Ordered from least to most eager to pull.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PullPolicy {
+    Never,
+    /// `.container` default.
+    Missing,
+    Newer,
+    /// `.image` default (`podman pull`'s own).
+    Always,
+}
+
+impl PullPolicy {
+    /// `None` for anything but the four values podman accepts.
+    fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "always" => Some(Self::Always),
+            "missing" => Some(Self::Missing),
+            "never" => Some(Self::Never),
+            "newer" => Some(Self::Newer),
+            _ => None,
+        }
+    }
+
+    /// The value to pass to `podman pull --policy=`.
+    pub fn as_podman_arg(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Missing => "missing",
+            Self::Never => "never",
+            Self::Newer => "newer",
+        }
+    }
 }
 
 const PULL_PASSTHROUGH_FLAGS: &[&str] = &[
@@ -129,12 +166,16 @@ pub(crate) fn extract_images(
         let content = crate::install::envsubst(&content, env_vars);
 
         let primary_section = if is_container { "Container" } else { "Image" };
+        let (policy_key, mut pull_policy) = if is_container {
+            ("Pull=", PullPolicy::Missing)
+        } else {
+            ("Policy=", PullPolicy::Always)
+        };
         let mut current_section: Option<&str> = None;
 
         let mut image_val = None;
         let mut auth_file = None;
         let mut tls_verify = None;
-        let mut pull_never = false;
         let mut podman_args_raw: Vec<String> = Vec::new();
 
         for line in content.lines() {
@@ -150,9 +191,9 @@ pub(crate) fn extract_images(
                         image_val = Some(val.to_string());
                     }
                 }
-                if let Some(val) = trimmed.strip_prefix("Pull=") {
-                    if val.trim().eq("never") {
-                        pull_never = true;
+                if let Some(val) = trimmed.strip_prefix(policy_key) {
+                    if let Some(policy) = PullPolicy::parse(val) {
+                        pull_policy = policy;
                     }
                 }
                 if let Some(val) = trimmed.strip_prefix("PodmanArgs=") {
@@ -177,7 +218,7 @@ pub(crate) fn extract_images(
             }
         }
 
-        if pull_never {
+        if pull_policy == PullPolicy::Never {
             continue;
         }
         if let Some(image) = image_val {
@@ -195,6 +236,7 @@ pub(crate) fn extract_images(
                 auth_file,
                 tls_verify,
                 podman_args,
+                pull_policy,
             });
         }
     }
@@ -202,12 +244,21 @@ pub(crate) fn extract_images(
     images
 }
 
-/// Deduplicate image references by image name, keeping the first occurrence.
+/// Deduplicate image references by image name, keeping the first occurrence
+/// with the most eager pull policy of all its duplicates.
 ///
 /// NOTE! Does not handle auth_file or tls_verify.
 pub(crate) fn dedup_images(images: &mut Vec<ImageRef>) {
+    let mut policies: HashMap<String, PullPolicy> = HashMap::new();
+    for r in images.iter() {
+        let policy = policies.entry(r.image.clone()).or_insert(r.pull_policy);
+        *policy = (*policy).max(r.pull_policy);
+    }
     let mut seen = HashSet::new();
-    images.retain(|r| seen.insert(r.image.clone()));
+    images.retain_mut(|r| {
+        r.pull_policy = policies[&r.image];
+        seen.insert(r.image.clone())
+    });
 }
 
 #[cfg(test)]
@@ -368,6 +419,97 @@ mod tests {
         let images = extract_images_helper(&["app.container".to_string()], tmp.path(), &vars);
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].image, "ghcr.io/myorg/app:v2");
+    }
+
+    // pull policy
+
+    #[rstest]
+    #[case::container_default_missing(
+        "app.container",
+        "[Container]\nImage=a\n",
+        PullPolicy::Missing
+    )]
+    #[case::container_missing(
+        "app.container",
+        "[Container]\nImage=a\nPull=missing\n",
+        PullPolicy::Missing
+    )]
+    #[case::container_always(
+        "app.container",
+        "[Container]\nImage=a\nPull=always\n",
+        PullPolicy::Always
+    )]
+    #[case::container_newer(
+        "app.container",
+        "[Container]\nImage=a\nPull=newer\n",
+        PullPolicy::Newer
+    )]
+    #[case::container_unknown_value(
+        "app.container",
+        "[Container]\nImage=a\nPull=bogus\n",
+        PullPolicy::Missing
+    )]
+    #[case::container_ignores_policy_key(
+        "app.container",
+        "[Container]\nImage=a\nPolicy=always\n",
+        PullPolicy::Missing
+    )]
+    #[case::image_default_always("app.image", "[Image]\nImage=a\n", PullPolicy::Always)]
+    #[case::image_missing("app.image", "[Image]\nImage=a\nPolicy=missing\n", PullPolicy::Missing)]
+    #[case::image_ignores_pull_key(
+        "app.image",
+        "[Image]\nImage=a\nPull=missing\n",
+        PullPolicy::Always
+    )]
+    fn extract_images_pull_policy(
+        #[case] filename: &str,
+        #[case] content: &str,
+        #[case] expected: PullPolicy,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join(filename), content).unwrap();
+
+        let images = extract_images_helper(&[filename.to_string()], tmp.path(), &HashMap::new());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].pull_policy, expected);
+    }
+
+    #[test]
+    fn extract_images_skips_image_with_policy_never() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("app.image"),
+            "[Image]\nImage=a\nPolicy=never\n",
+        )
+        .unwrap();
+
+        let images = extract_images_helper(&["app.image".to_string()], tmp.path(), &HashMap::new());
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn dedup_images_keeps_most_eager_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("a.container"), "[Container]\nImage=x\n").unwrap();
+        fs::write(tmp.path().join("b.image"), "[Image]\nImage=x\n").unwrap();
+        fs::write(
+            tmp.path().join("c.container"),
+            "[Container]\nImage=x\nPull=newer\n",
+        )
+        .unwrap();
+
+        let mut images = extract_images_helper(
+            &[
+                "a.container".to_string(),
+                "b.image".to_string(),
+                "c.container".to_string(),
+            ],
+            tmp.path(),
+            &HashMap::new(),
+        );
+        dedup_images(&mut images);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].pull_policy, PullPolicy::Always);
     }
 
     #[test]

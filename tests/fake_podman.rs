@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use common::{test_config, TestWriter};
-use quadcd::sync::{ImagePuller, ImageRef, Podman};
+use quadcd::sync::{ImagePuller, ImageRef, Podman, PullPolicy};
 
 fn fake_cmd() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_cmd.sh")
@@ -37,6 +37,7 @@ fn simple_image(name: &str) -> ImageRef {
         auth_file: None,
         tls_verify: None,
         podman_args: vec![],
+        pull_policy: PullPolicy::Missing,
     }
 }
 
@@ -111,6 +112,7 @@ fn pull_passes_authfile_flag() {
         auth_file: Some("/run/secrets/auth.json".to_string()),
         tls_verify: None,
         podman_args: vec![],
+        pull_policy: PullPolicy::Missing,
     };
     podman.pull(&image, &cfg);
 
@@ -131,6 +133,7 @@ fn pull_passes_tls_verify_flag() {
         auth_file: None,
         tls_verify: Some(false),
         podman_args: vec![],
+        pull_policy: PullPolicy::Missing,
     };
     podman.pull(&image, &cfg);
 
@@ -148,6 +151,7 @@ fn pull_passes_all_flags() {
         auth_file: Some("/auth.json".to_string()),
         tls_verify: Some(true),
         podman_args: vec![],
+        pull_policy: PullPolicy::Missing,
     };
     podman.pull(&image, &cfg);
 
@@ -171,12 +175,50 @@ fn pull_passes_podman_args() {
         auth_file: None,
         tls_verify: None,
         podman_args: vec!["--os=linux".to_string(), "--arch=amd64".to_string()],
+        pull_policy: PullPolicy::Missing,
     };
     podman.pull(&image, &cfg);
 
     let stderr = err_buf.captured();
     assert!(
         stderr.contains("--os=linux") && stderr.contains("--arch=amd64"),
+        "stderr: {stderr}"
+    );
+}
+
+// pull policy
+
+#[test]
+fn pull_passes_policy_flag() {
+    let podman = fake_podman(1);
+    let (cfg, err_buf) = test_cfg_with_capture(false);
+
+    let image = ImageRef {
+        image: "registry.example.com/app:v1".to_string(),
+        auth_file: None,
+        tls_verify: None,
+        podman_args: vec![],
+        pull_policy: PullPolicy::Always,
+    };
+    podman.pull(&image, &cfg);
+
+    let stderr = err_buf.captured();
+    assert!(
+        stderr.contains("--policy") && stderr.contains("always"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn pull_default_policy_is_missing() {
+    let podman = fake_podman(1);
+    let (cfg, err_buf) = test_cfg_with_capture(false);
+
+    podman.pull(&simple_image("registry.example.com/app:v1"), &cfg);
+
+    let stderr = err_buf.captured();
+    assert!(
+        stderr.contains("--policy") && stderr.contains("missing"),
         "stderr: {stderr}"
     );
 }

@@ -52,7 +52,7 @@ impl Podman {
 
 impl ImagePuller for Podman {
     fn pull(&self, image: &ImageRef, cfg: &Config) {
-        let mut args: Vec<&str> = vec!["pull"];
+        let mut args: Vec<&str> = vec!["pull", "--policy", image.pull_policy.as_podman_arg()];
 
         if let Some(auth_file) = &image.auth_file {
             args.push("--authfile");
