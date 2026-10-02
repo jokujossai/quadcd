@@ -19,6 +19,7 @@ QuadCD is a Rust systemd generator and git-sync deployment tool for Quadlet and 
 - `src/sync/vcs.rs` - `Vcs` trait and `GitVcs` implementation
 - `src/sync/image.rs` - `ImagePuller` trait for container image pre-pull
 - `src/sync/units.rs` - changed-unit detection and activation
+- `src/sync/settings.rs` - `[X-QuadCD]` per-unit settings (`StartOnSync=`)
 - `src/sync/systemd.rs` - systemd operations
 - `tests/` - unit and integration tests
 - `tests/containerized/` - containerized integration tests

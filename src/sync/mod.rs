@@ -13,6 +13,7 @@ mod image;
 mod podman;
 mod repo;
 mod runner;
+mod settings;
 mod systemd;
 mod units;
 mod vcs;

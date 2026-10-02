@@ -1,6 +1,6 @@
 //! `SyncRunner`: one-shot and long-running sync orchestration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -16,6 +16,7 @@ use crate::install;
 
 use super::image::{dedup_images, extract_images, ImagePuller, ImageRef};
 use super::repo::{safe_repo_dir, sync_repo_inner, SyncResult, SyncStatus};
+use super::settings::start_on_sync_units;
 use super::systemd::SystemdTrait;
 use super::units::{
     all_unit_files, execute_activation, plan_activation, stop_deleted_units_inner, ActivationPlan,
@@ -196,8 +197,12 @@ impl<'a> SyncRunner<'a> {
 
     /// Decide how the changed units should be activated. Must run after
     /// `daemon-reload` so systemd reports the updated unit files.
-    pub(crate) fn plan_activation(&self, changed_files: &[String]) -> ActivationPlan {
-        plan_activation(self.systemd, changed_files, self.cfg)
+    pub(crate) fn plan_activation(
+        &self,
+        changed_files: &[String],
+        start_on_sync: &HashSet<String>,
+    ) -> ActivationPlan {
+        plan_activation(self.systemd, changed_files, start_on_sync, self.cfg)
     }
 
     /// Start or restart the planned units using `self.systemd`. Returns the
@@ -325,7 +330,8 @@ impl<'a> SyncRunner<'a> {
         self.stop_deleted_units(&changes.deleted);
         self.systemd.daemon_reload(self.cfg);
 
-        let plan = self.plan_activation(&changes.changed);
+        let start_on_sync = start_on_sync_units(&self.cfg.effective_source_dirs(), self.cfg);
+        let plan = self.plan_activation(&changes.changed, &start_on_sync);
         let mut pulled = Self::files_worth_pulling(&changes.changed, &plan);
         // A pull can take minutes, during which an operator may stop or start
         // something. Re-plan afterwards so the units acted on reflect the
@@ -333,7 +339,7 @@ impl<'a> SyncRunner<'a> {
         // made on, and pull for whatever the new plan added. Planning is
         // read-only and silent, so repeating it costs no duplicate output.
         let plan = if self.pre_pull_images(&pulled) {
-            let replanned = self.plan_activation(&changes.changed);
+            let replanned = self.plan_activation(&changes.changed, &start_on_sync);
             let added: Vec<String> = Self::files_worth_pulling(&changes.changed, &replanned)
                 .into_iter()
                 .filter(|f| !pulled.contains(f))
@@ -954,6 +960,52 @@ mod tests {
             "the unit the re-plan added must get its image too"
         );
         assert_eq!(systemd.started.borrow().as_slice(), &["idle.service"]);
+    }
+
+    #[test]
+    fn apply_changes_first_deploy_builds_start_on_sync_image_before_container() {
+        // Fresh clone: every file is changed. The build is wanted by nothing,
+        // the container uses its image with `Pull=never` and no dependency.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+        cfg.data_dir = tmp.path().to_path_buf();
+        write_repo(
+            tmp.path(),
+            &[
+                (
+                    "app.build",
+                    "[Build]\nImageTag=localhost/app\n[X-QuadCD]\nStartOnSync=true\n",
+                ),
+                (
+                    "app.container",
+                    "[Container]\nImage=localhost/app\nPull=never\n[Install]\nWantedBy=default.target\n",
+                ),
+            ],
+        );
+
+        let vcs = MockVcs::new();
+        let systemd = MockSystemd::new();
+        systemd.set_active("default.target");
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        let puller = MockImagePuller::new();
+
+        let runner = SyncRunner::new(&cfg, &vcs, &systemd, &puller);
+        runner.apply_changes(&UnitChanges::from_present(vec![
+            "app.build".to_string(),
+            "app.container".to_string(),
+        ]));
+
+        let actions: Vec<String> = systemd
+            .call_log
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("start:") || c.starts_with("restart:"))
+            .cloned()
+            .collect();
+        assert_eq!(actions, &["start:app-build.service", "start:app.service"]);
     }
 
     // service_tick
