@@ -132,6 +132,30 @@ Units that stay stopped are left alone, and their container images are not pre-p
 
 A changed template unit (`myapp@.container`) is expanded to the instances systemd has loaded, and each instance is then judged by the same rules: running instances are restarted, stopped or failed ones are started only when something coming up wants or requires them. A template whose instances all stay stopped is not pre-pulled either.
 
+#### `[X-QuadCD]` Settings
+
+Per-unit sync settings go in an `[X-QuadCD]` section of the unit file itself. systemd ignores sections whose names start with `X-`, and Quadlet only checks keys in its own sections, so the section does not affect the unit. Sync reads it from the source files in the repo; no variable substitution is applied.
+
+```ini
+# app.build
+[Build]
+ImageTag=localhost/app
+SetWorkingDirectory=repo
+
+[X-QuadCD]
+StartOnSync=true
+```
+
+| Key | Description |
+|-----|-------------|
+| `StartOnSync=` | Boolean. When the unit changes and is inactive (or failed), start it even if nothing coming up wants it. |
+
+`StartOnSync=` is meant for units that nothing should start at boot but that must run when they change, such as an image build used by a container through `Image=localhost/...` and `Pull=never` rather than a `.build` reference (which would make the build a hard dependency of the container). It is the one deliberate exception to mirroring a reboot: a `StartOnSync=` unit that an operator stopped by hand is started again the next time it changes.
+
+`StartOnSync=` units are started (or restarted, when already active) before every other unit in the same sync, in a `systemctl` call of their own. That call waits for the job to finish, so on a first deploy the build completes before the container that uses its image is started. A failing `StartOnSync=` unit does not hold back the rest; it is reported with the other failures. A long build keeps sync busy for its whole duration.
+
+`StartOnSync=` on a template unit (`foo@.build`) is ignored with a warning, since sync cannot know which instances to start.
+
 SSH known hosts are stored in the data directory (`.known_hosts` file) to avoid issues with system SSH config under systemd sandboxing. Use `--accept-new-host-keys` for initial setup to automatically accept host keys on first connect, or `-i` for fully interactive SSH (manual host key approval, credential prompts).
 
 ### Version

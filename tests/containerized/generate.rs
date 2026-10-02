@@ -454,6 +454,38 @@ fn target_start_activates_only_units_with_install(mut ctx: TestContext) {
     );
 }
 
+/// Quadlet must accept an `[X-QuadCD]` section in its own unit types, since
+/// sync reads its per-unit settings from there.
+#[rstest]
+#[ignore]
+fn generate_accepts_x_quadcd_section(mut ctx: TestContext) {
+    let section = "\n[X-QuadCD]\nStartOnSync=true\n";
+    ctx.install_source(
+        "xq.container",
+        &format!("[Container]\nImage=localhost/xq\nPull=never\n{section}"),
+    );
+    ctx.install_source(
+        "xq.build",
+        &format!("[Build]\nImageTag=localhost/xq\nSetWorkingDirectory=unit\n{section}"),
+    );
+
+    let (normal, early, late) = generator_dirs();
+    let output = run_quadcd(&["generate", "-v", &normal, &early, &late]);
+    assert!(
+        output.status.success(),
+        "quadcd generate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    for unit in ["xq.service", "xq-build.service"] {
+        assert!(
+            PathBuf::from(&normal).join(unit).exists(),
+            "{unit} not generated in {normal}; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 #[ignore]
 #[test]
 fn version_flag() {

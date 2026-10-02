@@ -85,6 +85,11 @@ pub(crate) struct ActivationPlan {
     /// the conservative answer (no start, no pre-pull) is the one that keeps
     /// sync's post-run state equal to a reboot's.
     activating: HashSet<String>,
+    /// Units that set `StartOnSync=`. Planning starts them when inactive, and
+    /// execution starts or restarts them in calls of their own ahead of
+    /// everything else, so a build finishes before a container that uses its
+    /// image (without depending on it) is brought up in the same sync.
+    start_on_sync: HashSet<String>,
     /// Verbose lines describing the decisions, emitted by
     /// [`execute_activation`] rather than at planning time so a plan can be
     /// computed without logging (sync plans twice around a slow image pull).
@@ -130,7 +135,8 @@ impl ActivationPlan {
 ///   pre-pulled.
 /// - **Inactive** units: `start` only if some unit whose own activation would
 ///   drag them up is *coming up* — active, activating, or holding a queued
-///   start job. The relationships that qualify are `Wants=`, `Requires=`,
+///   start job, or the unit sets `StartOnSync=` (see below). The
+///   relationships that qualify are `Wants=`, `Requires=`,
 ///   `BindsTo=` and `Upholds=`, seen from this side as the reverse properties
 ///   in `START_AUTHORISING_PROPERTIES`. This mirrors boot: quadcd-deployed
 ///   units are all `generated`, so what starts them at boot is another unit
@@ -181,12 +187,20 @@ impl ActivationPlan {
 ///   service's image is not pre-pulled either, since this same classification
 ///   decides the pre-pull — see the note on `ActivationPlan::activating`.
 ///
+/// - **`StartOnSync=` units** (`start_on_sync`, from the `[X-QuadCD]`
+///   section): started when inactive regardless of reverse dependencies. This
+///   is the one deliberate exception to mirroring boot, for units such as
+///   image builds that nothing should start at boot but that must run when
+///   they change. Their start or restart is issued before the rest of the
+///   plan — see `ActivationPlan::start_on_sync`.
+///
 /// Planning performs no systemd state changes and logs nothing; the verbose
 /// account of the decisions is stored on the plan and written out by
 /// [`execute_activation`].
 pub(crate) fn plan_activation(
     systemd: &dyn SystemdTrait,
     changed_files: &[String],
+    start_on_sync: &HashSet<String>,
     cfg: &Config,
 ) -> ActivationPlan {
     let mut units: Vec<String> = changed_files
@@ -196,7 +210,10 @@ pub(crate) fn plan_activation(
     units.sort();
     units.dedup();
 
-    let mut plan = ActivationPlan::default();
+    let mut plan = ActivationPlan {
+        start_on_sync: start_on_sync.clone(),
+        ..ActivationPlan::default()
+    };
     // Units left alone, with the start-authorising reverse dependencies that
     // failed to justify starting them. Revisited below: a dependant this plan
     // activates will drag them in even though sync does not name them itself.
@@ -351,6 +368,15 @@ fn plan_unit(
         });
         mark_activating(plan, templates, unit);
         return Action::AlreadyStarting;
+    }
+
+    // Inactive, but the unit asks to be started whenever it changes. Boot
+    // would leave it stopped; that is the point of the setting.
+    if plan.start_on_sync.contains(unit) {
+        plan.note(cfg, || format!("Starting inactive {unit} (StartOnSync=)"));
+        plan.to_start.push(unit.to_string());
+        mark_activating(plan, templates, unit);
+        return Action::Start;
     }
 
     // Inactive: start only if boot would — i.e. some unit that would itself
@@ -529,6 +555,7 @@ pub(crate) fn execute_activation(
     let ActivationPlan {
         to_start,
         to_restart,
+        start_on_sync,
         notes,
         ..
     } = plan;
@@ -537,28 +564,29 @@ pub(crate) fn execute_activation(
         for note in notes {
             let _ = writeln!(cfg.output.err(), "[quadcd] {note}");
         }
-        if !to_start.is_empty() {
-            let _ = writeln!(
-                cfg.output.err(),
-                "[quadcd] Starting units: {}",
-                to_start.join(", ")
-            );
-        }
-        if !to_restart.is_empty() {
-            let _ = writeln!(
-                cfg.output.err(),
-                "[quadcd] Restarting units: {}",
-                to_restart.join(", ")
-            );
-        }
     }
 
-    if !to_start.is_empty() {
-        systemd.start(to_start, cfg);
-    }
-    if !to_restart.is_empty() {
-        systemd.restart(to_restart, cfg);
-    }
+    // `StartOnSync=` units go first, in calls of their own. `systemctl start`
+    // and `restart` wait for the job to finish, so a build is complete before
+    // anything that uses its image is started; within one call systemd would
+    // run them in parallel, since nothing orders them. A failure here does not
+    // hold back the rest: the post-activation report below names it.
+    let (first_start, rest_start): (Vec<String>, Vec<String>) = to_start
+        .iter()
+        .cloned()
+        .partition(|u| start_on_sync.contains(u));
+    let (first_restart, rest_restart): (Vec<String>, Vec<String>) = to_restart
+        .iter()
+        .cloned()
+        .partition(|u| start_on_sync.contains(u));
+    run_batch(
+        systemd,
+        &first_start,
+        &first_restart,
+        " (StartOnSync, first)",
+        cfg,
+    );
+    run_batch(systemd, &rest_start, &rest_restart, "", cfg);
 
     let mut activated: Vec<String> = to_start.iter().chain(to_restart.iter()).cloned().collect();
     activated.sort();
@@ -590,6 +618,38 @@ pub(crate) fn execute_activation(
     failed
 }
 
+/// Issue one `start` and one `restart` call for a batch of planned units.
+fn run_batch(
+    systemd: &dyn SystemdTrait,
+    to_start: &[String],
+    to_restart: &[String],
+    label: &str,
+    cfg: &Config,
+) {
+    if cfg.verbose {
+        if !to_start.is_empty() {
+            let _ = writeln!(
+                cfg.output.err(),
+                "[quadcd] Starting units{label}: {}",
+                to_start.join(", ")
+            );
+        }
+        if !to_restart.is_empty() {
+            let _ = writeln!(
+                cfg.output.err(),
+                "[quadcd] Restarting units{label}: {}",
+                to_restart.join(", ")
+            );
+        }
+    }
+    if !to_start.is_empty() {
+        systemd.start(to_start, cfg);
+    }
+    if !to_restart.is_empty() {
+        systemd.restart(to_restart, cfg);
+    }
+}
+
 /// Plan and immediately execute activation for `changed_files`.
 ///
 /// Convenience wrapper around [`plan_activation`] + [`execute_activation`] for
@@ -600,7 +660,7 @@ pub(crate) fn activate_changed_units_inner(
     changed_files: &[String],
     cfg: &Config,
 ) -> Vec<String> {
-    let plan = plan_activation(systemd, changed_files, cfg);
+    let plan = plan_activation(systemd, changed_files, &HashSet::new(), cfg);
     execute_activation(systemd, &plan, cfg)
 }
 
@@ -704,6 +764,20 @@ mod tests {
     use std::fs;
 
     use super::super::systemd::testing::MockSystemd;
+
+    /// Plan with no `StartOnSync=` units, which is what most tests need.
+    /// Shadows the glob-imported function of the same name.
+    fn plan_activation(
+        systemd: &dyn SystemdTrait,
+        changed_files: &[String],
+        cfg: &Config,
+    ) -> ActivationPlan {
+        super::plan_activation(systemd, changed_files, &HashSet::new(), cfg)
+    }
+
+    fn start_on_sync(units: &[&str]) -> HashSet<String> {
+        units.iter().map(|u| u.to_string()).collect()
+    }
 
     // is_unit_file
 
@@ -1669,6 +1743,150 @@ mod tests {
 
         assert_eq!(systemd.started.borrow().as_slice(), &["app.service"]);
         assert_eq!(systemd.restarted.borrow().as_slice(), &["web.service"]);
+    }
+
+    // StartOnSync=
+
+    #[test]
+    fn plan_starts_inactive_start_on_sync_unit_without_reverse_deps() {
+        let systemd = MockSystemd::new();
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = super::plan_activation(
+            &systemd,
+            &["app.build".into()],
+            &start_on_sync(&["app-build.service"]),
+            &cfg,
+        );
+
+        assert!(plan.activates_file("app.build"));
+        execute_activation(&systemd, &plan, &cfg);
+        assert_eq!(systemd.started.borrow().as_slice(), &["app-build.service"]);
+    }
+
+    #[test]
+    fn plan_skips_inactive_unit_without_start_on_sync() {
+        let systemd = MockSystemd::new();
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = super::plan_activation(
+            &systemd,
+            &["app.build".into()],
+            &start_on_sync(&["other-build.service"]),
+            &cfg,
+        );
+
+        assert!(!plan.activates_file("app.build"));
+        execute_activation(&systemd, &plan, &cfg);
+        assert!(systemd.started.borrow().is_empty());
+    }
+
+    #[test]
+    fn plan_starts_failed_start_on_sync_unit() {
+        let systemd = MockSystemd::new();
+        systemd.set_state("app-build.service", "failed", "failed");
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = super::plan_activation(
+            &systemd,
+            &["app.build".into()],
+            &start_on_sync(&["app-build.service"]),
+            &cfg,
+        );
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert_eq!(systemd.started.borrow().as_slice(), &["app-build.service"]);
+    }
+
+    #[test]
+    fn plan_leaves_coming_up_start_on_sync_unit_to_its_job() {
+        let systemd = MockSystemd::new();
+        systemd.set_activating("app-build.service");
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = super::plan_activation(
+            &systemd,
+            &["app.build".into()],
+            &start_on_sync(&["app-build.service"]),
+            &cfg,
+        );
+        execute_activation(&systemd, &plan, &cfg);
+
+        assert!(systemd.started.borrow().is_empty());
+        assert!(systemd.restarted.borrow().is_empty());
+    }
+
+    #[test]
+    fn execute_activation_runs_start_on_sync_units_first() {
+        // First deploy: the container is wanted by default.target and the
+        // build is not wanted by anything. The build must be started, and
+        // finish, before the container — in its own call, because nothing
+        // orders the two.
+        let systemd = MockSystemd::new();
+        systemd.set_active("default.target");
+        systemd.reverse_deps_map.borrow_mut().insert(
+            "app.service".to_string(),
+            vec!["default.target".to_string()],
+        );
+        systemd.set_active("web.service");
+        systemd.set_active("web-build.service");
+        let cfg = test_config(Box::new(Vec::new()), Box::new(Vec::new()));
+
+        let plan = super::plan_activation(
+            &systemd,
+            &[
+                "app.build".into(),
+                "app.container".into(),
+                "web.build".into(),
+                "web.container".into(),
+            ],
+            &start_on_sync(&["app-build.service", "web-build.service"]),
+            &cfg,
+        );
+        execute_activation(&systemd, &plan, &cfg);
+
+        let actions: Vec<String> = systemd
+            .call_log
+            .borrow()
+            .iter()
+            .filter(|c| c.starts_with("start:") || c.starts_with("restart:"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            actions,
+            &[
+                "start:app-build.service",
+                "restart:web-build.service",
+                "start:app.service",
+                "restart:web.service",
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_verbose_notes_start_on_sync() {
+        let err = crate::output::tests::TestWriter::new();
+        let mut cfg = test_config(Box::new(Vec::new()), Box::new(err.clone()));
+        cfg.verbose = true;
+        let systemd = MockSystemd::new();
+
+        let plan = super::plan_activation(
+            &systemd,
+            &["app.build".into()],
+            &start_on_sync(&["app-build.service"]),
+            &cfg,
+        );
+        execute_activation(&systemd, &plan, &cfg);
+
+        let out = err.captured();
+        assert!(
+            out.contains("Starting inactive app-build.service (StartOnSync=)"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("Starting units (StartOnSync, first): app-build.service"),
+            "got: {out}"
+        );
     }
 
     #[test]
