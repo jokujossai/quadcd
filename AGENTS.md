@@ -35,7 +35,10 @@ QuadCD is a Rust systemd generator and git-sync deployment tool for Quadlet and 
 - Keep writing short: say what and the one non-obvious why, no history or edge-case essays.
   - Commit message: subject line plus at most 3 body lines.
   - CHANGELOG entry: 1–2 sentences.
-  - Code comment: only what the code does not already say.
+  - Code comment (`//`): only what the code does not already say.
+  - Doc comment (`///`): every function, type and field that had one keeps
+    one. Short, but keep the contract: what it returns, error behaviour,
+    preconditions (e.g. "before `daemon-reload`") and known gaps.
 
 ## Before Committing
 
