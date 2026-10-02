@@ -5,6 +5,11 @@
 ### Added
 
 - `StartOnSync=` setting in a new `[X-QuadCD]` unit-file section. systemd ignores `X-` sections, so the setting does not affect the unit itself; sync reads it from the source files in the repo. A changed unit with `StartOnSync=true` that is inactive (or failed) is started even when nothing coming up wants it — for units such as image builds that nothing should start at boot but that must run when they change. `StartOnSync=` units are started (or restarted) before every other unit in the same sync, in a `systemctl` call of their own that waits for the job to finish, so on a first deploy a build completes before a container that uses its image via `Pull=never` without depending on it. A `StartOnSync=` unit an operator stopped by hand is started again the next time it changes. The setting is ignored with a warning on template units.
+- `Watch=<glob>` setting in the `[X-QuadCD]` section: when a sync's diff touches a file matching the glob (relative to the unit file's directory; `*`, `?` and `**` supported; repeatable), the unit is treated as changed even though its own file is not — for example a `.build` unit watching its `Containerfile` and build context. Matching is per repository, against added, modified, deleted and renamed paths.
+
+### Changed
+
+- **Breaking (API):** `UnitChanges` gained a public `other` field holding the non-unit paths a diff touched. Code constructing `UnitChanges` with a struct literal must add it (or use `..UnitChanges::default()`). `is_empty` and `len` still count unit files only.
 
 ## 0.3.0 - 2026-08-19
 

@@ -144,17 +144,24 @@ SetWorkingDirectory=repo
 
 [X-QuadCD]
 StartOnSync=true
+Watch=Containerfile
+Watch=repo/**
 ```
 
 | Key | Description |
 |-----|-------------|
 | `StartOnSync=` | Boolean. When the unit changes and is inactive (or failed), start it even if nothing coming up wants it. |
+| `Watch=` | Glob of other repo files, relative to the unit file's directory. When a sync's diff touches a matching file, the unit is treated as changed even though its own file is not. May be given multiple times; an empty `Watch=` clears the list. |
 
 `StartOnSync=` is meant for units that nothing should start at boot but that must run when they change, such as an image build used by a container through `Image=localhost/...` and `Pull=never` rather than a `.build` reference (which would make the build a hard dependency of the container). It is the one deliberate exception to mirroring a reboot: a `StartOnSync=` unit that an operator stopped by hand is started again the next time it changes.
 
 `StartOnSync=` units are started (or restarted, when already active) before every other unit in the same sync, in a `systemctl` call of their own. That call waits for the job to finish, so on a first deploy the build completes before the container that uses its image is started. A failing `StartOnSync=` unit does not hold back the rest; it is reported with the other failures. A long build keeps sync busy for its whole duration.
 
 `StartOnSync=` on a template unit (`foo@.build`) is ignored with a warning, since sync cannot know which instances to start.
+
+`Watch=` globs support `*` and `?` within one path segment and `**` as a whole segment matching any number of directories (`repo/**` matches every file below `repo/`). `..` may be used as long as the path stays inside the repository; globs that escape it, and absolute paths, are ignored with a warning. Added, modified, deleted and renamed files all count. A unit marked changed this way is then handled like any other changed unit: restarted when active, or started when inactive if `StartOnSync=` is set or something coming up wants it.
+
+`Watch=` only sees the diff between the commits before and after a sync, within the unit's own repository. A fresh clone already treats every unit as changed. Files changed outside sync — for example by a manual `git pull` in the data directory — are not noticed, because the next sync finds nothing new to diff.
 
 SSH known hosts are stored in the data directory (`.known_hosts` file) to avoid issues with system SSH config under systemd sandboxing. Use `--accept-new-host-keys` for initial setup to automatically accept host keys on first connect, or `-i` for fully interactive SSH (manual host key approval, credential prompts).
 

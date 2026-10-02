@@ -17,6 +17,7 @@ mod settings;
 mod systemd;
 mod units;
 mod vcs;
+mod watch;
 
 pub use image::{ImagePuller, ImageRef};
 pub use podman::Podman;
