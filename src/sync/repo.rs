@@ -6,6 +6,7 @@ use crate::config::Config;
 
 use super::units::all_unit_files;
 use super::vcs::UnitChanges;
+use super::watch::mark_watched;
 use super::Vcs;
 
 /// Result of syncing a single repository.
@@ -127,7 +128,7 @@ pub(crate) fn sync_repo_inner(
             UnitChanges::from_present(all_unit_files(repo_dir))
         } else {
             match (pre_sha.as_deref(), post_sha.as_deref()) {
-                (Some(old), Some(new)) if old != new => vcs.changed_files(repo_dir, old, new),
+                (Some(old), Some(new)) if old != new => diff(vcs, repo_dir, old, new, cfg),
                 (Some(old), Some(new)) if old == new => return Ok(SyncStatus::AlreadyUpToDate),
                 _ => UnitChanges::from_present(all_unit_files(repo_dir)),
             }
@@ -152,12 +153,21 @@ pub(crate) fn sync_repo_inner(
     match (pre_sha.as_deref(), post_sha.as_deref()) {
         (Some(old), Some(new)) if old == new => Ok(SyncStatus::AlreadyUpToDate),
         (Some(old), Some(new)) => Ok(SyncStatus::Updated {
-            changes: vcs.changed_files(repo_dir, old, new),
+            changes: diff(vcs, repo_dir, old, new, cfg),
         }),
         _ => Ok(SyncStatus::Updated {
             changes: UnitChanges::from_present(all_unit_files(repo_dir)),
         }),
     }
+}
+
+/// Unit changes between two commits, with units whose `Watch=` globs match a
+/// changed non-unit file added. Done here, while the diff's paths are still
+/// tied to this repo; the caller merges changes across repos.
+fn diff(vcs: &dyn Vcs, repo_dir: &Path, old: &str, new: &str, cfg: &Config) -> UnitChanges {
+    let mut changes = vcs.changed_files(repo_dir, old, new);
+    mark_watched(repo_dir, &mut changes, cfg);
+    changes
 }
 
 #[cfg(test)]
@@ -263,6 +273,56 @@ mod tests {
     }
 
     #[rstest]
+    fn sync_repo_pull_marks_watching_unit_changed(fixture: SyncRepoFixture) {
+        let vcs = &fixture.vcs;
+        fs::write(
+            fixture.repo_dir.join("app.build"),
+            "[Build]\nImageTag=localhost/app\n[X-QuadCD]\nWatch=Containerfile\n",
+        )
+        .unwrap();
+
+        *vcs.head_sha_val.borrow_mut() = Some("old_sha".to_string());
+        *vcs.post_pull_sha.borrow_mut() = Some("new_sha".to_string());
+        *vcs.changed_files_val.borrow_mut() = UnitChanges {
+            other: vec!["Containerfile".to_string()],
+            ..UnitChanges::default()
+        };
+        let result = fixture.sync().unwrap();
+
+        match result {
+            SyncStatus::Updated { changes } => {
+                assert_eq!(changes.changed, vec!["app.build"]);
+            }
+            _ => panic!("expected Updated"),
+        }
+    }
+
+    #[rstest]
+    fn sync_repo_watch_does_not_reach_into_another_repo(fixture: SyncRepoFixture) {
+        // A sibling repo watches a file of the same name; this repo's diff
+        // must not mark it.
+        let sibling = fixture.repo_dir.parent().unwrap().join("other-repo");
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(
+            sibling.join("app.build"),
+            "[Build]\nImageTag=localhost/app\n[X-QuadCD]\nWatch=Containerfile\n",
+        )
+        .unwrap();
+        let vcs = &fixture.vcs;
+        *vcs.head_sha_val.borrow_mut() = Some("old_sha".to_string());
+        *vcs.post_pull_sha.borrow_mut() = Some("new_sha".to_string());
+        *vcs.changed_files_val.borrow_mut() = UnitChanges {
+            other: vec!["Containerfile".to_string()],
+            ..UnitChanges::default()
+        };
+
+        match fixture.sync().unwrap() {
+            SyncStatus::Updated { changes } => assert!(changes.is_empty()),
+            _ => panic!("expected Updated"),
+        }
+    }
+
+    #[rstest]
     fn sync_repo_existing_updated_with_deletions(fixture: SyncRepoFixture) {
         let vcs = &fixture.vcs;
 
@@ -271,6 +331,7 @@ mod tests {
         *vcs.changed_files_val.borrow_mut() = UnitChanges {
             changed: vec!["new.container".to_string()],
             deleted: vec!["gone.container".to_string()],
+            ..UnitChanges::default()
         };
         let result = fixture.sync().unwrap();
 

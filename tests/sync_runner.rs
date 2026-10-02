@@ -518,6 +518,7 @@ fn run_once_stops_deleted_units_before_reload() {
     *vcs.changed_files_val.borrow_mut() = UnitChanges {
         changed: vec!["web.container".to_string()],
         deleted: vec!["gone.container".to_string()],
+        ..UnitChanges::default()
     };
     let systemd = MockSystemd::new();
     systemd.set_active("gone.service");
@@ -573,8 +574,8 @@ fn run_once_sync_only_does_not_stop_deleted() {
     *vcs.head_sha_val.borrow_mut() = Some("old".to_string());
     *vcs.post_pull_sha.borrow_mut() = Some("new".to_string());
     *vcs.changed_files_val.borrow_mut() = UnitChanges {
-        changed: vec![],
         deleted: vec!["gone.container".to_string()],
+        ..UnitChanges::default()
     };
     let systemd = MockSystemd::new();
     systemd.set_active("gone.service");

@@ -900,10 +900,9 @@ mod tests {
         });
 
         let runner = SyncRunner::new(&cfg, &vcs, &systemd, &puller);
-        runner.apply_changes(&UnitChanges {
-            changed: vec!["app.container".to_string()],
-            deleted: Vec::new(),
-        });
+        runner.apply_changes(&UnitChanges::from_present(
+            vec!["app.container".to_string()],
+        ));
 
         assert_eq!(puller.pulled.borrow().len(), 1, "the image is pre-pulled");
         assert!(
@@ -946,10 +945,10 @@ mod tests {
         });
 
         let runner = SyncRunner::new(&cfg, &vcs, &systemd, &puller);
-        runner.apply_changes(&UnitChanges {
-            changed: vec!["app.container".to_string(), "idle.container".to_string()],
-            deleted: Vec::new(),
-        });
+        runner.apply_changes(&UnitChanges::from_present(vec![
+            "app.container".to_string(),
+            "idle.container".to_string(),
+        ]));
 
         assert_eq!(
             puller.pulled.borrow().as_slice(),

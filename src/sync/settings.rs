@@ -24,13 +24,17 @@ pub(crate) const SECTION: &str = "X-QuadCD";
 pub(crate) struct UnitSettings {
     /// Start the unit when it changes even though nothing coming up wants it.
     pub start_on_sync: bool,
+    /// Globs, relative to the unit file's directory, of other repo files
+    /// whose change marks this unit changed.
+    pub watch: Vec<String>,
 }
 
 /// Parse the `[X-QuadCD]` section of a unit file.
 ///
 /// Returns the settings plus a warning for every key or value that was not
-/// understood. Repeated keys follow systemd's rule: the last one wins. No
-/// variable substitution is applied.
+/// understood. Repeated keys follow systemd's rules: for `StartOnSync=` the
+/// last one wins, `Watch=` accumulates and an empty `Watch=` resets the list.
+/// No variable substitution is applied.
 pub(crate) fn parse_settings(content: &str) -> (UnitSettings, Vec<String>) {
     let mut settings = UnitSettings::default();
     let mut warnings = Vec::new();
@@ -58,6 +62,8 @@ pub(crate) fn parse_settings(content: &str) -> (UnitSettings, Vec<String>) {
                 Some(b) => settings.start_on_sync = b,
                 None => warnings.push(format!("invalid boolean StartOnSync={value}")),
             },
+            "Watch" if value.is_empty() => settings.watch.clear(),
+            "Watch" => settings.watch.push(value.to_string()),
             _ => warnings.push(format!("unknown key {key}")),
         }
     }
@@ -145,6 +151,15 @@ mod tests {
     fn parse_settings_start_on_sync(#[case] content: &str, #[case] expected: bool) {
         let (settings, warnings) = parse_settings(content);
         assert_eq!(settings.start_on_sync, expected);
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn parse_settings_watch_accumulates_and_empty_resets() {
+        let (settings, warnings) = parse_settings(
+            "[X-QuadCD]\nWatch=dropped\nWatch=\nWatch=Containerfile\nWatch = rootless/**\n",
+        );
+        assert_eq!(settings.watch, vec!["Containerfile", "rootless/**"]);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
 

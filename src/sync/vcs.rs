@@ -12,10 +12,14 @@ use super::is_unit_file;
 ///
 /// `changed` contains files present at the new tree (added, modified, renamed-to,
 /// copied-to). `deleted` contains files that no longer exist (removed, renamed-from).
+/// `other` contains every non-unit path the diff touched, present or deleted;
+/// sync matches them against `Watch=` globs to mark units changed. It does not
+/// count towards [`UnitChanges::is_empty`] or [`UnitChanges::len`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UnitChanges {
     pub changed: Vec<String>,
     pub deleted: Vec<String>,
+    pub other: Vec<String>,
 }
 
 impl UnitChanges {
@@ -31,13 +35,14 @@ impl UnitChanges {
     pub fn extend(&mut self, other: UnitChanges) {
         self.changed.extend(other.changed);
         self.deleted.extend(other.deleted);
+        self.other.extend(other.other);
     }
 
     /// Construct from a list of present files with no deletions (e.g. fresh clone).
     pub fn from_present(changed: Vec<String>) -> Self {
         Self {
             changed,
-            deleted: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -182,7 +187,8 @@ impl GitVcs {
 /// Each line is `STATUS\tPATH`, except renames/copies which are
 /// `R<score>\tOLD\tNEW` / `C<score>\tOLD\tNEW`. For renames, the old path is
 /// treated as deleted and the new path as changed; for copies, the old path is
-/// untouched and only the new path is added.
+/// untouched and only the new path is added. Non-unit paths go to `other`
+/// whether present or deleted.
 fn parse_name_status(stdout: &str) -> UnitChanges {
     let mut changes = UnitChanges::default();
     for line in stdout.lines() {
@@ -195,44 +201,48 @@ fn parse_name_status(stdout: &str) -> UnitChanges {
         match kind {
             b'D' => {
                 if let Some(path) = parts.next() {
-                    if is_unit_file(path) {
-                        changes.deleted.push(path.to_string());
-                    }
+                    changes.record(path, false);
                 }
             }
             b'R' => {
-                let old = parts.next();
-                let new = parts.next();
-                if let Some(o) = old {
-                    if is_unit_file(o) {
-                        changes.deleted.push(o.to_string());
-                    }
+                if let Some(old) = parts.next() {
+                    changes.record(old, false);
                 }
-                if let Some(n) = new {
-                    if is_unit_file(n) {
-                        changes.changed.push(n.to_string());
-                    }
+                if let Some(new) = parts.next() {
+                    changes.record(new, true);
                 }
             }
             b'C' => {
                 // Source is untouched; only the new path is "added".
                 let _old = parts.next();
-                if let Some(n) = parts.next() {
-                    if is_unit_file(n) {
-                        changes.changed.push(n.to_string());
-                    }
+                if let Some(new) = parts.next() {
+                    changes.record(new, true);
                 }
             }
             _ => {
                 if let Some(path) = parts.next() {
-                    if is_unit_file(path) {
-                        changes.changed.push(path.to_string());
-                    }
+                    changes.record(path, true);
                 }
             }
         }
     }
     changes
+}
+
+impl UnitChanges {
+    /// File one path from a diff: unit files into `changed` or `deleted`
+    /// depending on whether they exist in the new tree, anything else into
+    /// `other`.
+    fn record(&mut self, path: &str, present: bool) {
+        let list = if !is_unit_file(path) {
+            &mut self.other
+        } else if present {
+            &mut self.changed
+        } else {
+            &mut self.deleted
+        };
+        list.push(path.to_string());
+    }
 }
 
 impl Vcs for GitVcs {
@@ -509,11 +519,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_name_status_filters_non_units() {
+    fn parse_name_status_keeps_non_units_in_other() {
         let out = "A\tREADME.md\nM\tapp.container\nD\tnotes.txt\n";
         let changes = parse_name_status(out);
         assert_eq!(changes.changed, vec!["app.container".to_string()]);
         assert!(changes.deleted.is_empty());
+        assert_eq!(
+            changes.other,
+            vec!["README.md".to_string(), "notes.txt".to_string()]
+        );
+        assert_eq!(changes.len(), 1, "other paths are not unit changes");
+    }
+
+    #[test]
+    fn parse_name_status_other_covers_renames_and_copies() {
+        let out = "R100\tctx/old.sh\tctx/new.sh\nC90\tContainerfile\tContainerfile.alt\n";
+        let changes = parse_name_status(out);
+        assert!(changes.is_empty());
+        assert_eq!(
+            changes.other,
+            vec![
+                "ctx/old.sh".to_string(),
+                "ctx/new.sh".to_string(),
+                "Containerfile.alt".to_string(),
+            ],
+            "both sides of a rename, only the target of a copy"
+        );
     }
 
     #[test]
