@@ -19,10 +19,8 @@ pub struct UnitState {
     pub need_daemon_reload: bool,
     /// `NRestarts` — total restart count for the current invocation.
     pub n_restarts: u32,
-    /// `ActiveEnterTimestampMonotonic` (microseconds since boot). `None` when
-    /// the unit has never become active or systemctl returned no value.
-    /// Monotonic is used because it is emitted by `systemctl show` as a plain
-    /// integer (the wall-clock variant is a localised date string).
+    /// `ActiveEnterTimestampMonotonic` (µs since boot); monotonic because the
+    /// wall-clock variant is a localised string.
     pub active_enter_timestamp_monotonic: Option<u64>,
     /// `FragmentPath` — path to the unit file currently loaded by systemd.
     pub fragment_path: Option<String>,
@@ -41,19 +39,13 @@ impl UnitState {
         }
     }
 
-    /// Treat any state other than `active` and `activating` as a failure
-    /// worth surfacing to the operator after a start/restart.
+    /// Anything but `active`/`activating` after a start or restart.
     pub fn is_failure(&self) -> bool {
         !matches!(self.active_state.as_str(), "active" | "activating")
     }
 }
 
-/// A unit's `ActiveState` and `SubState` — the one pair every activation
-/// decision is derived from.
-///
-/// Both come from a single `systemctl show`, so a caller asking several
-/// questions about the same unit ("is it running?", "is it on its way up?")
-/// pays for one query and cannot get answers that contradict each other.
+/// A unit's `ActiveState` and `SubState`, from one `systemctl show`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationState {
     pub active_state: String,
@@ -68,19 +60,12 @@ impl ActivationState {
         }
     }
 
-    /// The state systemctl reports when it cannot say — every predicate below
-    /// answers `false`, which is the conservative reading for all of them.
+    /// Every predicate below answers `false` for this.
     pub fn unknown() -> Self {
         Self::new("unknown", "unknown")
     }
 
-    /// Running, by the same rule as `systemctl is-active`.
-    ///
-    /// That command exits 0 for `reloading` as well as `active`, and since
-    /// systemd v254 also for `refreshing` (a soft-reboot mount refresh). A
-    /// unit reloading its configuration is running throughout — dropping
-    /// either state here would silently narrow behaviour against the
-    /// `is-active` call this replaced.
+    /// Running, by `systemctl is-active`'s rule (includes `reloading`, `refreshing`).
     pub fn is_active(&self) -> bool {
         matches!(
             self.active_state.as_str(),
@@ -88,105 +73,29 @@ impl ActivationState {
         )
     }
 
-    /// Part-way through starting: `ActiveState=activating`.
+    /// `ActiveState=activating`.
     pub fn is_starting(&self) -> bool {
         self.active_state == "activating"
     }
 
-    /// Waiting out `Restart=` between attempts: `activating (auto-restart)`.
-    ///
-    /// Reported as `activating`, but nothing is starting — the unit failed and
-    /// systemd is holding it in a restart backoff. A crash-looping unit can sit
-    /// here indefinitely, so it is not evidence that anything it wants belongs
-    /// running.
+    /// `activating (auto-restart)`: failed and waiting out `Restart=`; nothing
+    /// is actually starting.
     pub fn is_auto_restarting(&self) -> bool {
         self.is_starting() && self.sub_state == "auto-restart"
     }
 }
 
-/// `systemctl show` properties naming the units that, when active, would cause
-/// systemd to start this unit.
+/// Reverse dependencies whose active unit would make systemd start this one.
 ///
-/// These are the reverse (`…By`/`…Of`) dependency properties systemd derives
-/// automatically from the forward setting on the *other* unit; they cannot be
-/// written directly. Every property here has the same meaning for sync — "an
-/// active unit over there implies this unit belongs running" — which is what
-/// lets [`parse_reverse_deps`] union them into one flat list.
-///
-/// **Included**
-/// - `WantedBy` (inverse of `Wants=`) and `RequiredBy` (inverse of
-///   `Requires=`): the `[Install]` relationships, materialised as
-///   `.wants/`/`.requires/` symlinks. Starting the dependant pulls this unit
-///   in; at boot that dependant is typically `default.target`.
-/// - `BoundBy` (inverse of `BindsTo=`): `BindsTo=` is `Requires=` plus
-///   propagated stop, so an active binder starts this unit exactly as a
-///   requirer would (and would stop again without it).
-/// - `UpheldBy` (inverse of `Upholds=`): "as long as this unit is up, all
-///   units listed in `Upholds=` are started whenever found to be inactive or
-///   failed". An active upholder is the strongest possible statement that
-///   this unit should be running — systemd would restart it continuously.
-///
-/// **Deliberately excluded**
-/// - `ConsistsOf` (inverse of `PartOf=`): `PartOf=` configures dependencies
-///   "similar to `Requires=`, but limited to stopping and restarting of
-///   units". It never propagates a *start*, so an active `PartOf=` parent
-///   says nothing about whether this unit should run — including it would
-///   start units a reboot would leave stopped, which is exactly the state
-///   divergence sync is trying to avoid.
-/// - `RequisiteOf` (inverse of `Requisite=`): `Requisite=` deliberately does
-///   not start the unit; it fails the *dependant* if this unit is not
-///   already active. So an active requisite-of unit is evidence this unit was
-///   already up, not a reason to start it.
-/// - `TriggeredBy` (`.socket`/`.timer`/`.path` units): the entire point of
-///   socket, timer and path activation is that the service starts on demand.
-///   An active `.socket` means the service is *ready to be* started, and boot
-///   leaves it inactive — starting it during sync would diverge from the
-///   state a reboot produces. See the note in `plan_activation` about the
-///   pre-pull side of this trade-off.
-///
-///   This does not make sync ignore triggered services: `plan_activation`
-///   tests `is_active` first and short-circuits, so a socket-activated
-///   service that happens to be running when its file changes is restarted
-///   like any other active unit. This property set only ever gates the
-///   *inactive* branch.
-/// - `ConflictedBy` (inverse of `Conflicts=`): a negative relationship. An
-///   active conflicting unit forces this one *stopped*.
-/// - `StopPropagatedFrom`/`ReloadPropagatedFrom` (inverses of
-///   `PropagatesStopTo=`/`PropagatesReloadTo=`): propagate stop and reload
-///   respectively, never start.
-/// - `Before`/`After`: pure ordering. They constrain *when* a unit starts
-///   relative to another, never *whether* it starts at all.
-///
-/// The names must match systemd's spelling exactly. `systemctl show` fetches
-/// the unit's properties over D-Bus and filters the reply against the names
-/// asked for, so a name the running systemd does not know simply matches
-/// nothing: no line is emitted for it and the exit status is still 0. A typo
-/// would therefore degrade silently to "no reverse dependencies" rather than
-/// failing loudly. The names are verified against `systemd.unit(5)` and the
-/// `org.freedesktop.systemd1` `Unit` interface.
-///
-/// The same mechanism makes an old systemd degrade gracefully: `UpheldBy`
-/// arrived in systemd 249, and below that it contributes nothing instead of
-/// erroring.
+/// Excluded because they never start a unit: `ConsistsOf` (`PartOf=`),
+/// `RequisiteOf`, `TriggeredBy` (socket/timer/path start on demand),
+/// `ConflictedBy`, `*PropagatedFrom`, ordering. Unknown names (a typo, or
+/// `UpheldBy` before systemd 249) silently match nothing.
 const START_AUTHORISING_PROPERTIES: [&str; 4] = ["WantedBy", "RequiredBy", "BoundBy", "UpheldBy"];
 
-/// Parse the unit names out of a `systemctl show --value` listing of
-/// [`START_AUTHORISING_PROPERTIES`].
-///
-/// Splitting the whole output on whitespace unions the properties, which is
-/// only sound because every queried property authorises a start identically —
-/// none of them needs to be told apart from the others. `--value` prints bare
-/// values in systemd's own property order, one line per property, with nothing
-/// to say which line is which: a property that is *known but empty* emits a
-/// blank line, and a property the running systemd does not implement (such as
-/// `UpheldBy` before systemd 249) emits no line at all, silently shifting
-/// every later line up. Positions are therefore unusable, and a property
-/// needing different treatment would have to be fetched without `--value` and
-/// parsed as `KEY=value` lines instead. The union is immune to both cases.
-///
-/// Unit names never contain whitespace, so the split is unambiguous. Results
-/// are deduplicated: a unit that both wants and requires this one is listed by
-/// two properties but is a single reverse dependency.
+/// Deduplicated unit names from `systemctl show --value` output. Lines cannot
+/// be told apart (missing properties shift them), so all are unioned; that is
+/// fine because every property means the same.
 fn parse_reverse_deps(stdout: &str) -> Vec<String> {
     let mut deps: Vec<String> = Vec::new();
     for name in stdout.split_whitespace() {
@@ -197,38 +106,20 @@ fn parse_reverse_deps(stdout: &str) -> Vec<String> {
     deps
 }
 
-/// Abstraction over systemctl operations.
-///
-/// `Systemd` shells out to systemctl; tests can substitute a mock that records
-/// calls without requiring a running systemd.
+/// systemctl operations; mocked in tests.
 pub trait SystemdTrait {
     fn daemon_reload(&self, cfg: &Config);
     fn restart(&self, units: &[String], cfg: &Config);
     fn start(&self, units: &[String], cfg: &Config);
     fn stop(&self, units: &[String], cfg: &Config);
-    /// Return the `is-enabled` state string for a unit (e.g. "enabled", "static",
-    /// "disabled", "masked", "generated"). Returns "unknown" on error.
+    /// `is-enabled` output (e.g. "enabled", "generated"); "unknown" on error.
     fn is_enabled(&self, unit: &str, cfg: &Config) -> String;
-    /// Return `true` if the unit is currently active (running), by
-    /// `systemctl is-active`'s rule — which also covers `reloading` and, since
-    /// systemd v254, `refreshing`.
-    ///
-    /// Defaults to projecting [`SystemdTrait::activation_state`], the same
-    /// backward-compat pattern that method uses for [`SystemdTrait::show_state`].
+    /// Running, by `systemctl is-active`'s rule. Defaults to [`SystemdTrait::activation_state`].
     fn is_active(&self, unit: &str, cfg: &Config) -> bool {
         self.activation_state(unit, cfg).is_active()
     }
-    /// Return the unit's `ActiveState` and `SubState`.
-    ///
-    /// Every activation decision is derived from this pair, so one query
-    /// answers all of them for a unit. `systemctl is-active` cannot stand in:
-    /// it collapses `activating` and `failed` into the same non-zero exit, and
-    /// says nothing about the sub-state that separates a unit genuinely
-    /// starting from one idling in `auto-restart` backoff.
-    ///
-    /// Defaults to projecting [`SystemdTrait::show_state`], so implementors
-    /// need not add anything; [`Systemd`] overrides it with a narrower
-    /// `systemctl show` that asks for just these two properties.
+    /// `ActiveState` and `SubState`. Defaults to [`SystemdTrait::show_state`];
+    /// [`Systemd`] queries only these two properties.
     fn activation_state(&self, unit: &str, cfg: &Config) -> ActivationState {
         let state = self.show_state(unit, cfg);
         ActivationState {
@@ -236,40 +127,17 @@ pub trait SystemdTrait {
             sub_state: state.sub_state,
         }
     }
-    /// Return the units that have a queued start (or restart) job.
-    ///
-    /// A unit whose start job is queued but has not run yet is still
-    /// `ActiveState=inactive`, `SubState=dead` — indistinguishable from a
-    /// stopped unit by state alone. This is how a target looks while the units
-    /// ordered before it are starting: it implicitly orders itself after
-    /// everything it wants, so its own job cannot complete until theirs have.
-    ///
-    /// Read from `systemctl list-jobs` rather than per-unit
-    /// `show --property=Job` because that property carries only the job id.
-    /// The type is what matters: a queued `stop` job means the opposite of a
-    /// queued `start`, and only `list-jobs` reports it.
-    ///
-    /// Job *types* are filtered, not job semantics: a reboot enqueues a
-    /// **start** job for `shutdown.target`, and this returns it like any
-    /// other. The residual cost is small — systemd refuses a start it
-    /// considers destructive for `DefaultDependencies=yes` units, so a unit
-    /// wanted by a shutdown target yields a wasted image pull and a failed
-    /// `systemctl start` in the log, not a running unit. Empty on error.
+    /// Units with a queued start or restart job (from `list-jobs`, which has
+    /// the job type). Such units still read `inactive`. Empty on error.
+    /// Includes `shutdown.target` during a reboot; systemd refuses those
+    /// starts, so the cost is a wasted pull and a logged failure.
     fn pending_start_jobs(&self, cfg: &Config) -> Vec<String>;
-    /// Return the units whose activation would make systemd start this unit:
-    /// the reverse dependencies `WantedBy`, `RequiredBy`, `BoundBy` and
-    /// `UpheldBy` (see `START_AUTHORISING_PROPERTIES` for why those four and
-    /// no others), including targets linked via generator
-    /// `.wants`/`.requires` symlinks. Deduplicated; empty on error.
+    /// Units that would start this one (`START_AUTHORISING_PROPERTIES`).
+    /// Deduplicated; empty on error.
     fn reverse_deps(&self, unit: &str, cfg: &Config) -> Vec<String>;
-    /// List loaded unit names matching a glob pattern (e.g. "foo@*.service").
-    ///
-    /// Backed by `list-units --all`, so inactive and failed units are
-    /// reported alongside running ones: callers that care about the state —
-    /// activation does, stopping does not — must check it themselves.
+    /// Loaded units matching a glob (`foo@*.service`), in any state.
     fn list_units_matching(&self, pattern: &str, cfg: &Config) -> Vec<String>;
-    /// Return the unit's `ActiveState`, `SubState`, and `Result` via
-    /// `systemctl show`. Returns `UnitState::unknown()` if the call fails.
+    /// Full [`UnitState`] via `systemctl show`; `UnitState::unknown()` on error.
     fn show_state(&self, unit: &str, cfg: &Config) -> UnitState;
 }
 
@@ -325,15 +193,7 @@ impl Systemd {
         }
     }
 
-    /// Run `systemctl show <unit> --property=<p>...` for `properties` and
-    /// parse the `KEY=value` lines it prints. `None` on a failed or
-    /// non-zero-exit invocation — shared by [`SystemdTrait::activation_state`]
-    /// and [`SystemdTrait::show_state`], which differ only in which
-    /// properties they ask for and which struct they fold the pairs into.
-    ///
-    /// Parsed as `KEY=value` lines rather than with `--value`: the bare
-    /// values arrive in systemd's own property order with nothing to say
-    /// which line is which.
+    /// `systemctl show --property=...` as `KEY=value` pairs; `None` on failure.
     fn show_properties(
         &self,
         unit: &str,
@@ -506,11 +366,7 @@ impl SystemdTrait for Systemd {
     }
 
     fn activation_state(&self, unit: &str, cfg: &Config) -> ActivationState {
-        // Overrides the trait's `show_state`-based default with a two-property
-        // query. `show_state` also asks for `NeedDaemonReload`, which makes PID
-        // 1 stat the fragment and rescan the drop-in directories on every read
-        // — work worth doing for the status report it exists for, but not for
-        // the two strings the planner needs per unit.
+        // Cheaper than show_state: NeedDaemonReload makes PID 1 stat files.
         let Some(props) = self.show_properties(unit, &["ActiveState", "SubState"], cfg) else {
             return ActivationState::unknown();
         };
@@ -536,13 +392,7 @@ impl SystemdTrait for Systemd {
             return Vec::new();
         }
 
-        // Columns are `JOB UNIT TYPE STATE`, e.g.
-        //   175 default.target      start waiting
-        //   176 quadcd-sync.service start running
-        // Selecting on the type column also makes the parse independent of
-        // `--no-legend` actually suppressing the decorations: the header row's
-        // type column reads `TYPE` and the `N jobs listed.` footer has too few
-        // columns, so both drop out on their own.
+        // `JOB UNIT TYPE STATE`; header and footer drop out on the type filter.
         String::from_utf8_lossy(&capture.stdout)
             .lines()
             .filter_map(|line| {
@@ -698,18 +548,11 @@ mod tests {
 
     #[test]
     fn parse_reverse_deps_handles_properties_the_systemd_does_not_implement() {
-        // `systemctl show` filters the D-Bus reply against the requested
-        // names, so a property this systemd does not know emits *no* line
-        // rather than a blank one. On systemd < 249 `UpheldBy` does not exist,
-        // so only three lines come back — the union does not care that the
-        // remaining lines shifted up.
+        // systemd < 249: no UpheldBy line at all.
         assert_eq!(
             parse_reverse_deps("default.target\n\n\n"),
             vec!["default.target".to_string()]
         );
-        // A hypothetical systemd knowing none of the four (or a typo in every
-        // name) yields no output at all, which is the intended fail-closed
-        // "no reverse dependencies".
         assert_eq!(parse_reverse_deps(""), Vec::<String>::new());
     }
 
@@ -740,25 +583,12 @@ pub mod testing {
         /// `"restart:bar"`, …) so tests can assert ordering across methods.
         pub call_log: RefCell<Vec<String>>,
         pub enabled_map: RefCell<HashMap<String, String>>,
-        /// Every unit's state, as the one `ActiveState`/`SubState` pair systemd
-        /// would report. `is_active`, `activation_state` and `show_state` all
-        /// read this, so the mock cannot express a combination systemd cannot
-        /// produce — a unit that is `is_active() == false` while `show_state()`
-        /// says `active`, say, which would hide any mismatch between the
-        /// predicates and `systemctl is-active`.
-        ///
-        /// Units absent from the map are `inactive (dead)`; the `set_*` helpers
-        /// below are the intended way to populate it.
+        /// Single source for every state query; absent = `inactive (dead)`.
+        /// Populate with the `set_*` helpers.
         pub state_map: RefCell<HashMap<String, UnitState>>,
-        /// Units with a queued start job: still `inactive`, but systemd is on
-        /// its way to bringing them up. This is how a boot target looks while
-        /// the units ordered before it are starting.
+        /// Units with a queued start job (still `inactive`).
         pub queued_start_jobs: RefCell<Vec<String>>,
-        /// Canned [`SystemdTrait::reverse_deps`] answers. Flat lists, like the
-        /// real implementation: every start-authorising relationship it
-        /// queries authorises a start identically, so there is nothing for a
-        /// test to tell apart here — a `WantedBy` entry and an `UpheldBy`
-        /// entry are indistinguishable by construction.
+        /// Canned [`SystemdTrait::reverse_deps`] answers.
         pub reverse_deps_map: RefCell<HashMap<String, Vec<String>>>,
         pub listed_units: RefCell<HashMap<String, Vec<String>>>,
     }
@@ -844,10 +674,7 @@ pub mod testing {
                 })
         }
 
-        /// Bring a unit up the way a successful `systemctl start`/`restart`
-        /// does, so post-activation state reads reflect the actions taken.
-        /// A state a test pinned explicitly wins — that is how a unit that
-        /// fails to come up is expressed.
+        /// Mark a started unit active, unless the test pinned its state.
         fn record_activation(&self, unit: &str) {
             if !self.state_map.borrow().contains_key(unit) {
                 self.set_active(unit);

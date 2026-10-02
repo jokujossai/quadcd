@@ -142,15 +142,8 @@ impl<'a> SyncRunner<'a> {
         self
     }
 
-    /// Pre-pull container images for changed `.container` and `.image` files.
-    ///
-    /// Reads `Image=` lines from the source files in each repo directory,
-    /// applies variable substitution, and pulls each unique image so that
-    /// restarts don't incur image download time.
-    ///
-    /// Returns `true` if a pull was attempted — that is, if any of `files`
-    /// yielded an image reference. `ImagePuller::pull` reports failures
-    /// itself, so a `true` here does not promise the image is now local.
+    /// Pull each unique image of `files` (`.container`/`.image`, after variable
+    /// substitution). Returns whether any pull was attempted, not whether it succeeded.
     pub(crate) fn pre_pull_images(&self, files: &[String]) -> bool {
         if files.is_empty() {
             return false;
@@ -188,9 +181,7 @@ impl<'a> SyncRunner<'a> {
             .collect()
     }
 
-    /// Whether a changed file is one pre-pull looks at all. Mirrors the
-    /// extension check in `extract_images`; used to keep the skip report
-    /// about images rather than about every unit that stays stopped.
+    /// Same extension check as `extract_images`.
     fn may_carry_image(filename: &str) -> bool {
         filename.ends_with(".container") || filename.ends_with(".image")
     }
@@ -211,10 +202,7 @@ impl<'a> SyncRunner<'a> {
         execute_activation(self.systemd, plan, self.cfg)
     }
 
-    /// Stop units whose backing files were deleted by the sync.
-    ///
-    /// Must run **before** `daemon-reload`, while systemd still knows about
-    /// the units; otherwise the running containers/services become orphaned.
+    /// Must run before `daemon-reload`, while systemd still knows the units.
     pub(crate) fn stop_deleted_units(&self, deleted_files: &[String]) {
         stop_deleted_units_inner(self.systemd, deleted_files, self.cfg);
     }
@@ -296,16 +284,8 @@ impl<'a> SyncRunner<'a> {
         }
     }
 
-    /// Reload units after a sync.
-    ///
-    /// Order matters: deleted units must be stopped **before** `daemon-reload`
-    /// so systemd can still locate them; otherwise the underlying containers
-    /// or processes become orphaned. After the reload, the activation plan is
-    /// computed, images for the units it will activate are pre-pulled, and the
-    /// plan is executed.
-    ///
-    /// No-op when `changes` is empty. In sync-only mode, logs the changes but
-    /// skips all systemd interaction.
+    /// Stop deleted units, `daemon-reload`, plan, pre-pull, activate.
+    /// `--sync-only` only logs the changes.
     fn apply_changes(&self, changes: &UnitChanges) {
         if changes.is_empty() {
             return;
@@ -333,11 +313,7 @@ impl<'a> SyncRunner<'a> {
         let start_on_sync = start_on_sync_units(&self.cfg.effective_source_dirs(), self.cfg);
         let plan = self.plan_activation(&changes.changed, &start_on_sync);
         let mut pulled = Self::files_worth_pulling(&changes.changed, &plan);
-        // A pull can take minutes, during which an operator may stop or start
-        // something. Re-plan afterwards so the units acted on reflect the
-        // state at that moment rather than the state the pull decision was
-        // made on, and pull for whatever the new plan added. Planning is
-        // read-only and silent, so repeating it costs no duplicate output.
+        // State can change during a long pull, so re-plan after it.
         let plan = if self.pre_pull_images(&pulled) {
             let replanned = self.plan_activation(&changes.changed, &start_on_sync);
             let added: Vec<String> = Self::files_worth_pulling(&changes.changed, &replanned)
@@ -382,22 +358,14 @@ impl<'a> SyncRunner<'a> {
         result.failures
     }
 
-    /// Check whether a `notify` event targets the config file.
-    ///
-    /// Returns `true` only for `Modify` or `Create` events whose paths
-    /// include `config_path`.  We watch the parent directory (to catch
-    /// editor rename-replace patterns), so this filter is essential to
-    /// ignore unrelated file changes in the same directory.
+    /// Modify/Create on the config file itself. The parent directory is
+    /// watched (editors replace files), so other files must be filtered out.
     pub(crate) fn is_config_event(event: &notify::Event, config_path: &Path) -> bool {
         matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_))
             && event.paths.iter().any(|p| p == config_path)
     }
 
-    /// Compare the config file's current `mtime` against `last`.
-    ///
-    /// Returns `Some(new_mtime)` when the file has been modified since
-    /// `last` (or when `last` is `None`), allowing the caller to trigger
-    /// a reload.  Returns `None` when unchanged or on any I/O error.
+    /// `Some(mtime)` if the file is newer than `last`; `None` if not or on error.
     pub(crate) fn check_config_mtime(path: &Path, last: Option<SystemTime>) -> Option<SystemTime> {
         let mtime = fs::metadata(path).ok()?.modified().ok()?;
         if last.map_or(true, |old| mtime > old) {
@@ -407,10 +375,7 @@ impl<'a> SyncRunner<'a> {
         }
     }
 
-    /// Long-running service loop that syncs repos on interval and watches the
-    /// config file for changes.
-    ///
-    /// Runs until the `shutdown` flag is set (e.g. by a signal handler).
+    /// Sync repos on their intervals and reload on config changes until `shutdown`.
     pub fn run_service(self, cd_config: CDConfig, shutdown: &AtomicBool) {
         // Initial sync — held under the sync lock, then released before the
         // main loop so manual `quadcd sync` invocations can run between ticks.
@@ -543,9 +508,7 @@ impl<'a> SyncRunner<'a> {
                 );
             }
 
-            // Interruptible sleep: wake early on SIGTERM or a config-file change.
-            // Using recv_timeout instead of thread::sleep means a notify event
-            // breaks the sleep immediately rather than waiting for the full tick.
+            // Sleep that wakes on SIGTERM or a config change.
             let sleep_step = std::time::Duration::from_millis(200);
             let mut remaining = tick;
             while remaining > std::time::Duration::ZERO {
@@ -575,14 +538,8 @@ impl<'a> SyncRunner<'a> {
         let _ = writeln!(self.cfg.output.err(), "[quadcd] Shutting down");
     }
 
-    /// Attempt to reload the config file when a change notification is received.
-    ///
-    /// Drains duplicate notifications from the channel, reads the new config,
-    /// warns about URL changes (unless `--force`), updates `last_sync` for new
-    /// repos, and syncs all repos if the reload succeeds.
-    ///
-    /// Returns `Some(new_config)` on successful reload, `None` otherwise
-    /// (the caller keeps the current config).
+    /// Reload the config and sync all repos. Warns about URL changes unless
+    /// `--force`; new repos start their interval now. `None` keeps the current config.
     pub(crate) fn try_reload_config(
         &self,
         rx: &mpsc::Receiver<()>,
@@ -674,14 +631,8 @@ impl<'a> SyncRunner<'a> {
         }
     }
 
-    /// Try to acquire the sync lock and run one `service_tick`. If the lock
-    /// is held by another process (typically a manual `quadcd sync`), the
-    /// tick is skipped and `consecutive_skips` is incremented; a log line is
-    /// emitted every skip so operators can see how long the service has
-    /// deferred. `consecutive_skips` is reset to 0 on successful acquire.
-    ///
-    /// Returns the number of repositories that failed to sync this tick
-    /// (always 0 when the tick was skipped).
+    /// Run one tick under the sync lock. If a manual sync holds it, skip, log
+    /// and count the skip (reset on success). Returns the number of failed repos.
     pub(crate) fn try_acquire_and_tick(
         &self,
         rx: &mpsc::Receiver<()>,
@@ -717,12 +668,8 @@ impl<'a> SyncRunner<'a> {
         }
     }
 
-    /// Execute one iteration of the service loop.
-    ///
-    /// Checks the channel for config-change notifications, reloads if needed,
-    /// then syncs any repos whose interval has elapsed. Mutates `current_config`,
-    /// `last_sync`, and `tick` as appropriate.
-    /// Returns the number of repositories that failed to sync this tick.
+    /// Reload config if changed, then sync repos whose interval elapsed.
+    /// Returns the number of failed repos.
     pub(crate) fn service_tick(
         &self,
         rx: &mpsc::Receiver<()>,
@@ -835,11 +782,7 @@ mod tests {
     use super::super::systemd::testing::MockSystemd;
     use super::super::vcs::testing::MockVcs;
 
-    // apply_changes: pull / re-plan sequencing
-    //
-    // A real pull takes long enough for unit state to move under sync. These
-    // tests use a puller that mutates the mock systemd while "downloading",
-    // which is the only way to observe that the plan is recomputed.
+    // apply_changes: the puller below changes systemd state mid-pull.
 
     /// Image puller that applies `on_pull` to the systemd mock the first time
     /// it pulls, simulating state changing during a slow download.
