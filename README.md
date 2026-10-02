@@ -12,9 +12,7 @@ QuadCD deploys Quadlet and systemd unit files from local directories or git repo
 
 ## Usage
 
-Place your unit files in a subdirectory of the data directory and reload systemd. All subdirectories of the data directory are treated as source directories (e.g., `local/` for manually placed files, or named after git repos for synced files).
-
-Source directories are processed in lexicographic order, and files within each source tree are processed in lexicographic path order. If two files produce the same unit filename, the later path wins and quadcd warns about the duplicate.
+Put unit files in any subdirectory of the data directory (e.g. `local/`, or one per synced repo) and reload systemd. Files are processed in path order; if two produce the same unit name, the later wins with a warning.
 
 | Mode   | Data Directory             |
 |--------|----------------------------|
@@ -63,7 +61,7 @@ Store it at `~/.config/quadcd.toml`, then run:
 quadcd sync --user
 ```
 
-This clones the repository into `~/.local/share/quadcd/myapp/`, installs any supported Quadlet or systemd unit files it contains, reloads systemd, and starts or restarts changed units as needed.
+This clones the repo into `~/.local/share/quadcd/myapp/`, reloads systemd and activates changed units.
 
 ## Command Line Options
 
@@ -86,17 +84,13 @@ Generator mode is also activated automatically when:
 
 #### `[Install]` Sections in Plain Systemd Units
 
-Generated units cannot be enabled with `systemctl enable`, so an `[Install]` section alone would never make a plain `.service`, `.timer` or `.socket` start at boot. The generator therefore materialises the section itself, the same way Quadlet does for its own units: each target in `WantedBy=` gets a `<target>.wants/<unit>` symlink in the generator directory, and each target in `RequiredBy=` gets a `<target>.requires/<unit>` one. The links are relative, pointing at the installed unit next to the directory.
+Generated units cannot be enabled, so the generator turns `WantedBy=` and `RequiredBy=` into `<target>.wants/<unit>` and `<target>.requires/<unit>` symlinks, like Quadlet does. `Alias=`, `Also=` and `DefaultInstance=` are ignored.
 
 ```ini
-# backup.timer
+# backup.timer → timers.target.wants/backup.timer
 [Install]
 WantedBy=timers.target
 ```
-
-generates `timers.target.wants/backup.timer`, which is what pulls the timer in at boot — and, because sync starts an inactive changed unit when something that wants it is coming up (see [Sync](#sync-git-based-continuous-deployment) below), what lets a first sync start it too.
-
-Values are space-separated and accumulate across repeated assignments; an empty assignment (`WantedBy=`) resets the list, following systemd. Other `[Install]` directives — `Alias=`, `Also=`, `DefaultInstance=` — are not acted on. Quadlet units are unaffected: Podman's generator handles their `[Install]` sections.
 
 ### Sync (git-based continuous deployment)
 
@@ -114,27 +108,19 @@ quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i] [-
 | `-i`, `--interactive` | Enable interactive mode (allows SSH prompts for host keys, credentials) |
 | `--user` | Force user mode |
 
-Sync pulls unit files from configured git repositories into the data directory, then triggers `systemctl daemon-reload` and restarts changed units with `systemctl restart`.
+Sync pulls the configured repositories, runs `daemon-reload` and activates changed units the way a reboot would:
 
-A changed unit is restarted when it is active, and started when it is inactive but some unit that is *coming up* would itself start it — that is, that unit declares `Wants=`, `Requires=`, `BindsTo=` or `Upholds=` on it (seen from the changed unit's side as `WantedBy=`, `RequiredBy=`, `BoundBy=` and `UpheldBy=`). This approximates what a reboot would bring up, so a unit stopped by hand is not resurrected.
+- **Active** (or crash-looping) unit: restarted.
+- **Inactive** unit: started only if a unit that wants it (`WantedBy=`, `RequiredBy=`, `BoundBy=`, `UpheldBy=`) is coming up — active, activating, or with a queued start job. Units stopped by hand stay stopped. `PartOf=`, `Requisite=`, `Conflicts=` and socket/timer/path activation do not count.
+- **Already starting** unit: left to its job; the new config applies on its next restart.
+- **Template**: each loaded instance follows the rules above.
+- **Deleted** unit: stopped before `daemon-reload`.
 
-"Coming up" means running (`active`, or mid-`reload`), `activating`, or holding a queued start job. The last case is what makes the first sync after a reboot work: a target implicitly orders itself after every unit it wants, so until those have started it stays `inactive` with its own start job queued — targets never report `activating`. Whether the boot target is still queued when the first sync runs depends on what else is starting at the time; on a fast boot it may already be `active`. Both readings have to work, and before this only the `active` one did.
-
-A unit that is `activating (auto-restart)` — failed and waiting out `Restart=` — does not count as coming up. It is reported as `activating` but is starting nothing, and a crash-looping unit can sit there indefinitely; treating it as authority would let a failing service restart a unit an operator stopped, once per sync, for as long as it keeps failing.
-
-A changed unit that is *itself* already coming up is left to the job systemd has in flight: sync issues no command, because a restart would tear down a start already underway and a start would only be merged into the same job. Its image is still pre-pulled. Such a unit finishes starting with the configuration systemd loaded when the job was created — the pre-change one — and the new configuration applies the next time something restarts it.
-
-Relationships that never make systemd start a unit do not count: `PartOf=` only propagates stop and restart, `Requisite=` checks a unit rather than starting it, and `Conflicts=` stops it. Socket-, timer- and path-activated services are also left alone while inactive — the point of `TriggeredBy=` activation is that the service starts on demand, and a reboot leaves it inactive until the trigger fires. (One that is already running when its file changes is restarted like any other active unit.)
-
-`UpheldBy=` requires systemd 249 or newer. On older systemd it is simply not reported and contributes nothing to the decision; the other three relationships are unaffected.
-
-Units that stay stopped are left alone, and their container images are not pre-pulled. Images are still pre-pulled for units systemd starts as a dependency of a unit sync starts, such as an `.image` unit required by a `.container`.
-
-A changed template unit (`myapp@.container`) is expanded to the instances systemd has loaded, and each instance is then judged by the same rules: running instances are restarted, stopped or failed ones are started only when something coming up wants or requires them. A template whose instances all stay stopped is not pre-pulled either.
+Images are pre-pulled only for units that will be running. `UpheldBy=` needs systemd ≥ 249.
 
 #### `[X-QuadCD]` Settings
 
-Per-unit sync settings go in an `[X-QuadCD]` section of the unit file itself. systemd ignores sections whose names start with `X-`, and Quadlet only checks keys in its own sections, so the section does not affect the unit. Sync reads it from the source files in the repo; no variable substitution is applied.
+Per-unit sync settings, read from the source file without variable substitution. systemd and Quadlet ignore the section.
 
 ```ini
 # app.build
@@ -150,20 +136,13 @@ Watch=repo/**
 
 | Key | Description |
 |-----|-------------|
-| `StartOnSync=` | Boolean. When the unit changes and is inactive (or failed), start it even if nothing coming up wants it. |
-| `Watch=` | Glob of other repo files, relative to the unit file's directory. When a sync's diff touches a matching file, the unit is treated as changed even though its own file is not. May be given multiple times; an empty `Watch=` clears the list. |
+| `StartOnSync=` | Start the unit when it changes, even if nothing wants it. For builds that should not run at boot. |
+| `Watch=` | Glob of repo files (relative to the unit's directory) whose change marks the unit changed. Repeatable; empty value clears. |
 
-`StartOnSync=` is meant for units that nothing should start at boot but that must run when they change, such as an image build used by a container through `Image=localhost/...` and `Pull=never` rather than a `.build` reference (which would make the build a hard dependency of the container). It is the one deliberate exception to mirroring a reboot: a `StartOnSync=` unit that an operator stopped by hand is started again the next time it changes.
+- `StartOnSync=` units are started (or restarted) first and waited for, so a build finishes before the container using its image (`Pull=never`). A unit stopped by hand is started again when it changes. Ignored on templates.
+- `Watch=` supports `*`, `?` and `**`; paths outside the repository are ignored. Only changes pulled by sync are seen, not a manual `git pull`.
 
-`StartOnSync=` units are started (or restarted, when already active) before every other unit in the same sync, in a `systemctl` call of their own. That call waits for the job to finish, so on a first deploy the build completes before the container that uses its image is started. A failing `StartOnSync=` unit does not hold back the rest; it is reported with the other failures. A long build keeps sync busy for its whole duration.
-
-`StartOnSync=` on a template unit (`foo@.build`) is ignored with a warning, since sync cannot know which instances to start.
-
-`Watch=` globs support `*` and `?` within one path segment and `**` as a whole segment matching any number of directories (`repo/**` matches every file below `repo/`). `..` may be used as long as the path stays inside the repository; globs that escape it, and absolute paths, are ignored with a warning. Added, modified, deleted and renamed files all count. A unit marked changed this way is then handled like any other changed unit: restarted when active, or started when inactive if `StartOnSync=` is set or something coming up wants it.
-
-`Watch=` only sees the diff between the commits before and after a sync, within the unit's own repository. A fresh clone already treats every unit as changed. Files changed outside sync — for example by a manual `git pull` in the data directory — are not noticed, because the next sync finds nothing new to diff.
-
-SSH known hosts are stored in the data directory (`.known_hosts` file) to avoid issues with system SSH config under systemd sandboxing. Use `--accept-new-host-keys` for initial setup to automatically accept host keys on first connect, or `-i` for fully interactive SSH (manual host key approval, credential prompts).
+SSH known hosts are kept in `<data dir>/.known_hosts`. Use `--accept-new-host-keys` on first connect, or `-i` for interactive SSH.
 
 ### Version
 
@@ -212,9 +191,7 @@ These environment variables override quadcd's default behavior:
 
 ## Variable Substitution
 
-QuadCD supports `${VAR}` substitution using a `.env` file in the data directory (`~/.local/share/quadcd/.env` or `/var/lib/quadcd/.env`).
-
-Only variables defined in the `.env` file will be substituted, protecting other shell variables in your unit files.
+`${VAR}` is substituted from `<data dir>/.env`. Variables not defined there are left alone.
 
 ### Example
 
@@ -234,13 +211,7 @@ Image=${REGISTRY}/myimage:${IMAGE_TAG}
 
 ### Reserved Variables
 
-QuadCD always sets the following variable when processing a source directory; user `.env` files cannot override it.
-
-| Variable | Value |
-|----------|-------|
-| `QUADCD_REPO_ROOT` | Absolute path of the source directory the unit was loaded from (e.g. the synced repo checkout, or `~/.local/share/quadcd/local/`) |
-
-This lets you mount configuration files committed alongside your unit files into containers:
+`${QUADCD_REPO_ROOT}` is the absolute path of the unit's source directory and cannot be overridden. Use it to mount files committed next to the unit:
 
 **~/.local/share/quadcd/<repo>/myapp.container**:
 
@@ -250,11 +221,9 @@ Image=ghcr.io/me/app:latest
 Volume=${QUADCD_REPO_ROOT}/configs/app.yaml:/etc/app.yaml:Z,ro
 ```
 
-When the unit is generated, `${QUADCD_REPO_ROOT}` is replaced with the absolute path of the directory holding `myapp.container`.
-
 ## Drop-in Files
 
-Podman and systemd support drop-in configuration files that let you override or extend base unit files. QuadCD automatically symlinks `*.d/` drop-in directories from the standard Quadlet directory into the generator's working directory, so they are applied when the Podman generator runs.
+QuadCD symlinks `*.d/` drop-in directories from the standard Quadlet directory into the generator's working directory, so Podman applies them.
 
 ### Drop-in Directories
 
@@ -302,11 +271,7 @@ This only applies to `nginx.container`.
 
 ### Overriding the Drop-in Source Directory
 
-Set `QUADLET_DROPINS_UNIT_DIRS` to override the directory
-that QuadCD scans for `*.d/` drop-in directories. By default
-it uses the standard Quadlet directory for the current mode
-(`~/.config/containers/systemd/` for user mode,
-`/etc/containers/systemd/` for system mode).
+Set `QUADLET_DROPINS_UNIT_DIRS` to scan another directory for `*.d/` drop-ins.
 
 ## Install
 
@@ -314,11 +279,7 @@ it uses the standard Quadlet directory for the current mode
 curl -fsSL https://raw.githubusercontent.com/jokujossai/quadcd/main/install.sh | sudo sh
 ```
 
-This POSIX `sh` installer is fetched from `main`, but it installs the latest
-published release binary to `/usr/local/bin/quadcd`, creates symlinks in both
-user and system generator directories, installs sync service unit files, and
-prints instructions for enabling them. The installer is kept backward
-compatible with the latest published release assets and bundled service files.
+Installs the latest release binary, generator symlinks and sync service units, then prints how to enable the service.
 
 ### Installer Environment Variables
 

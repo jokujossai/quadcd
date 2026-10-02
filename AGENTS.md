@@ -32,6 +32,10 @@ QuadCD is a Rust systemd generator and git-sync deployment tool for Quadlet and 
 - Keep `AGENTS.md`, `README.md`, and `CONTRIBUTING.md` aligned with the codebase.
 - Add or update tests when changing behavior.
 - Prefer focused changes and avoid unrelated refactors.
+- Keep writing short: say what and the one non-obvious why, no history or edge-case essays.
+  - Commit message: subject line plus at most 3 body lines.
+  - CHANGELOG entry: 1–2 sentences.
+  - Code comment: only what the code does not already say.
 
 ## Before Committing
 
