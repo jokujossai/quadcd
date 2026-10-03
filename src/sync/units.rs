@@ -58,145 +58,51 @@ pub(crate) fn is_template_unit(unit_name: &str) -> bool {
         .is_some_and(|s| s.ends_with('@'))
 }
 
-/// What sync intends to do with a set of changed units.
-///
-/// Produced by [`plan_activation`] and carried out by [`execute_activation`].
-/// The decision is split from the execution so callers can act on it before
-/// anything is started — sync uses it to pre-pull images only for the units it
-/// is actually going to activate.
+/// What sync will start and restart. Planned before execution so images can be
+/// pre-pulled only for units that will run.
 #[derive(Debug, Default)]
 pub(crate) struct ActivationPlan {
     /// Inactive units to `systemctl start`.
     to_start: Vec<String>,
-    /// Active units — and running instances of changed templates — to
-    /// `systemctl restart`.
+    /// Active units and running template instances to `systemctl restart`.
     to_restart: Vec<String>,
-    /// Unit names as derived from the changed files, restricted to the ones
-    /// that will end up running: those started or restarted directly, plus
-    /// those systemd pulls in as a dependency of a unit being activated.
-    /// Templates appear un-instantiated (`foo@.service`) so a changed file
-    /// always maps back to a single entry.
-    ///
-    /// This doubles as the pre-pull set, so "will be running" and "should
-    /// have its image on disk" are currently one and the same decision. They
-    /// are not identical in principle — a socket-activated service will not
-    /// be started by sync, yet its image is plausibly wanted soon — but
-    /// splitting them would need a second set threaded through the plan, and
-    /// the conservative answer (no start, no pre-pull) is the one that keeps
-    /// sync's post-run state equal to a reboot's.
+    /// Units that will be running afterwards, including ones systemd pulls in
+    /// as dependencies. Templates appear un-instantiated. Also the pre-pull set.
     activating: HashSet<String>,
-    /// Units that set `StartOnSync=`. Planning starts them when inactive, and
-    /// execution starts or restarts them in calls of their own ahead of
-    /// everything else, so a build finishes before a container that uses its
-    /// image (without depending on it) is brought up in the same sync.
+    /// `StartOnSync=` units: started when inactive, and activated before the rest.
     start_on_sync: HashSet<String>,
-    /// Verbose lines describing the decisions, emitted by
-    /// [`execute_activation`] rather than at planning time so a plan can be
-    /// computed without logging (sync plans twice around a slow image pull).
+    /// Verbose output, printed at execution so planning twice logs once.
     notes: Vec<String>,
 }
 
 impl ActivationPlan {
-    /// Record a verbose note, skipping the formatting work when the run is
-    /// not verbose — nothing would ever print it.
+    /// Record a verbose note; formatting is skipped when not verbose.
     fn note(&mut self, cfg: &Config, message: impl FnOnce() -> String) {
         if cfg.verbose {
             self.notes.push(message());
         }
     }
 
-    /// Return `true` if the unit backing `filename` will be running after
-    /// this plan is executed — started, restarted, or pulled in by systemd
-    /// as a dependency of a unit being started.
+    /// Will the unit backing `filename` be running after this plan?
     pub(crate) fn activates_file(&self, filename: &str) -> bool {
         self.activating.contains(&unit_name_for_restart(filename))
     }
 }
 
-/// Decide how each changed unit should be activated.
+/// Decide how each changed unit is activated, mirroring what a reboot would
+/// run. Must run after `daemon-reload`. Read-only; logs nothing.
 ///
-/// Must run **after** `daemon-reload` so the systemd queries below see the
-/// updated unit files. Each changed unit is inspected:
-/// - **Active** units: `restart` — a running unit whose file changed keeps
-///   running with the new configuration.
-/// - **Crash-looping** units (`activating (auto-restart)`): also `restart`.
-///   Unlike the same state on a *dependant* — which does not authorise
-///   starting some other unit, since a crash loop is not evidence anything
-///   belongs running (see `ActiveStates::authorises_start`) — this is the
-///   unit's own change: no job is actually in flight, since systemd already
-///   gave up on the last attempt and is waiting out `Restart=`, so nothing is
-///   interrupted by restarting now, and doing so applies the new
-///   configuration immediately instead of leaving it stranded until whichever
-///   future backoff attempt happens to land, if the crash loop does not
-///   exhaust `StartLimitBurst` first.
-/// - Units **already coming up** (genuinely `activating`, or holding a queued
-///   start job): left to the job systemd already has in flight. No command is
-///   issued, but they are recorded as activated so their images are still
-///   pre-pulled.
-/// - **Inactive** units: `start` only if some unit whose own activation would
-///   drag them up is *coming up* — active, activating, or holding a queued
-///   start job, or the unit sets `StartOnSync=` (see below). The
-///   relationships that qualify are `Wants=`, `Requires=`,
-///   `BindsTo=` and `Upholds=`, seen from this side as the reverse properties
-///   in `START_AUTHORISING_PROPERTIES`. This mirrors boot: quadcd-deployed
-///   units are all `generated`, so what starts them at boot is another unit
-///   declaring one of those relationships (typically `default.target` via a
-///   `.wants`/`.requires` link materialised from `[Install]`). Anything else
-///   — including units an operator stopped by hand — is left alone, so sync
-///   never creates a running state that a reboot would not reproduce.
-/// - **Templates** (`foo@.service`): expanded to their loaded instances via
-///   `list-units`, and each instance is then judged by the two rules above.
-///   A template is not itself startable, so it never appears in the action
-///   lists; an instance an operator stopped (or one that failed and nothing
-///   active wants) is left alone exactly like a stopped regular unit.
+/// - Active or crash-looping: restart.
+/// - Already coming up (activating, or queued start job): leave to its job.
+/// - Inactive: start if `StartOnSync=`, or if a unit that wants it (see
+///   `START_AUTHORISING_PROPERTIES`) is coming up. A boot target is still
+///   inactive with a queued job during the first sync, so jobs count too.
+/// - Template: each loaded instance by the rules above.
 ///
-///   The queued-job case is what makes the first sync after a reboot work. A
-///   target implicitly orders itself after the units it wants, so its own job
-///   cannot complete until theirs have; until then it reads
-///   `ActiveState=inactive`, `SubState=dead` with a queued start job — targets
-///   never report `activating`. Whether the boot target is still in that state
-///   when quadcd's first sync runs is a race, not a guarantee:
-///   `quadcd-sync.service` is `Type=simple`, so its *own* start job completes
-///   the moment the process is forked and the target is never waiting on the
-///   sync itself. It is the other units ordered before the target that
-///   usually keep it queued, and on a fast boot it may well be `active` before
-///   the first clone finishes. Both readings have to work, which is why state
-///   and job are both consulted; before this, only the already-`active`
-///   reading did, and a freshly cloned unit looked unwanted.
-///
-///   The invariant survives because an operator-stopped unit is `inactive`
-///   with no job at all, and a dependant idling in `activating
-///   (auto-restart)` is excluded. It is not airtight: authority comes from the
-///   *dependant's* state, so an operator who stops a unit while a transaction
-///   that wants it is still queued — `systemctl stop app.service` during a
-///   stalled boot — sees sync start it again. Nothing distinguishes that from
-///   the unit simply not having been reached yet: systemd cancels the start
-///   job on stop and leaves no trace for the next sync to read. What this does *not* do is notice a unit on
-///   its way down: a queued `stop` job is filtered out of the job list, but a
-///   unit that is still `active` while its stop job waits answers "running"
-///   first and never reaches the job list — same as it did before this check
-///   existed.
-///
-///   Relationships that do *not* start a unit are excluded, so `PartOf=`
-///   (stop/restart propagation only) and `Requisite=` never cause a start
-///   here. Socket-, timer- and path-activated services (`TriggeredBy`) are
-///   also left alone *while inactive*: boot leaves them stopped until the
-///   trigger fires, and starting them eagerly would diverge from that. One
-///   that happens to be running is caught by the active branch above and
-///   restarted like anything else. The cost is that an inactive triggered
-///   service's image is not pre-pulled either, since this same classification
-///   decides the pre-pull — see the note on `ActivationPlan::activating`.
-///
-/// - **`StartOnSync=` units** (`start_on_sync`, from the `[X-QuadCD]`
-///   section): started when inactive regardless of reverse dependencies. This
-///   is the one deliberate exception to mirroring boot, for units such as
-///   image builds that nothing should start at boot but that must run when
-///   they change. Their start or restart is issued before the rest of the
-///   plan — see `ActivationPlan::start_on_sync`.
-///
-/// Planning performs no systemd state changes and logs nothing; the verbose
-/// account of the decisions is stored on the plan and written out by
-/// [`execute_activation`].
+/// Known gaps: a unit stopped by hand while the boot transaction that wants it
+/// is still queued is started again; inactive socket/timer/path-activated
+/// services are not pre-pulled; a unit still active with a queued stop job
+/// counts as running.
 pub(crate) fn plan_activation(
     systemd: &dyn SystemdTrait,
     changed_files: &[String],
@@ -214,22 +120,14 @@ pub(crate) fn plan_activation(
         start_on_sync: start_on_sync.clone(),
         ..ActivationPlan::default()
     };
-    // Units left alone, with the start-authorising reverse dependencies that
-    // failed to justify starting them. Revisited below: a dependant this plan
-    // activates will drag them in even though sync does not name them itself.
+    // Skipped units and their reverse deps; revisited by mark_transitively_activated.
     let mut skipped: Vec<(String, Vec<String>)> = Vec::new();
-    // Instance name -> the changed template it came from, so activating an
-    // instance can mark the template file for pre-pull.
+    // Instance -> template, so an activated instance marks its template file.
     let mut templates: HashMap<String, String> = HashMap::new();
-    // `default.target` is usually the reverse dependency of every changed
-    // unit, and each lookup spawns a systemctl call.
     let mut active = ActiveStates::new(systemd);
 
     for unit in &units {
         if is_template_unit(unit) {
-            // A template itself cannot be started; expand it to the
-            // instances systemd currently has loaded and judge each of them
-            // by the same rules as a regular unit.
             let pattern = unit.replace("@.", "@*.");
             let instances = systemd.list_units_matching(&pattern, cfg);
             if instances.is_empty() {
@@ -288,29 +186,20 @@ pub(crate) fn plan_activation(
     plan
 }
 
-/// What [`plan_unit`] decided for a single unit.
+/// What [`plan_unit`] decided for one unit.
 #[derive(Debug, PartialEq, Eq)]
 enum Action {
-    /// Active unit: restart it into the new configuration.
+    /// Running: restart into the new config.
     Restart,
-    /// Inactive unit that something coming up wants or requires: start it.
+    /// Inactive and wanted: start.
     Start,
-    /// Already on its way up under a job systemd has in flight. No command is
-    /// issued, but the unit will be running, so it counts as activated.
+    /// Left to the job systemd already has in flight; still counts as activated.
     AlreadyStarting,
-    /// Left alone — nothing that would start it is coming up, so boot would
-    /// not start it either.
+    /// Inactive and nothing would start it: left alone.
     Skip,
 }
 
-/// Decide what to do with one concrete (non-template) unit and record it on
-/// the plan.
-///
-/// Shared by the changed units themselves and by the instances a changed
-/// template expands to, so both obey the same policy: restart what is running,
-/// leave what is already starting to the job systemd has in flight, start what
-/// something coming up wants, and leave everything else — stopped by an
-/// operator, or failed with nothing depending on it — alone.
+/// Plan one concrete unit or template instance.
 fn plan_unit(
     systemd: &dyn SystemdTrait,
     unit: &str,
@@ -320,42 +209,22 @@ fn plan_unit(
     skipped: &mut Vec<(String, Vec<String>)>,
     cfg: &Config,
 ) -> Action {
-    // Running (including mid-`reload`): restart it into the new configuration.
     if active.is_active(unit, cfg) {
         plan.to_restart.push(unit.to_string());
         mark_activating(plan, templates, unit);
         return Action::Restart;
     }
 
-    // Crash-looping in its own `Restart=` backoff: reported as `activating`,
-    // like a unit genuinely coming up, but no job is actually in flight — the
-    // last attempt already failed and systemd is waiting out `Restart=`
-    // before trying again. Nothing is interrupted by restarting now, and
-    // doing so applies the new configuration immediately rather than leaving
-    // it stranded for a future attempt that may never come (a `git diff`
-    // between two commits reports no change once this file has already been
-    // seen once, so nothing revisits a unit sync did not act on today).
+    // Restart backoff has no job in flight, so restarting interrupts nothing
+    // and applies the new config now; no later sync would revisit this file.
     if active.state(unit, cfg).is_auto_restarting() {
         plan.to_restart.push(unit.to_string());
         mark_activating(plan, templates, unit);
         return Action::Restart;
     }
 
-    // Already coming up under a job systemd has in flight — genuinely
-    // `activating`, or still `inactive` with a queued start job. Nothing is
-    // issued: `restart` would abort a start already underway (tearing down a
-    // container that is just coming up), and `start` would only be merged
-    // into the same job. It
-    // is recorded as activated regardless, because it *will* be running, and
-    // that is what decides whether its image is pre-pulled — otherwise a
-    // multi-GB pull lands inline inside `podman run`.
-    //
-    // The unit therefore comes up with the configuration systemd loaded when
-    // the job was created, which is the pre-change one, and nothing revisits
-    // it: changed files come from a `git diff` between two commits, so the
-    // next sync sees no change for this file and the new configuration waits
-    // for whatever restarts the unit next. Sync cannot close that window —
-    // it is the price of not interrupting an in-flight start.
+    // A restart would abort the start underway and a start would merge into
+    // it. The unit comes up with the old config, but its image is pre-pulled.
     if active.is_coming_up(unit, cfg) {
         let state = active.state(unit, cfg);
         plan.note(cfg, || {
@@ -370,8 +239,6 @@ fn plan_unit(
         return Action::AlreadyStarting;
     }
 
-    // Inactive, but the unit asks to be started whenever it changes. Boot
-    // would leave it stopped; that is the point of the setting.
     if plan.start_on_sync.contains(unit) {
         plan.note(cfg, || format!("Starting inactive {unit} (StartOnSync=)"));
         plan.to_start.push(unit.to_string());
@@ -379,10 +246,7 @@ fn plan_unit(
         return Action::Start;
     }
 
-    // Inactive: start only if boot would — i.e. some unit that would itself
-    // start this one (wants, requires, binds to, or upholds it) is coming up.
-    // `[Install]` links show up here as targets (e.g. default.target); a unit
-    // nothing depends on, or one whose dependants are stopped, stays stopped.
+    // Start only if boot would: something that wants this unit is coming up.
     let deps = systemd.reverse_deps(unit, cfg);
     if deps.iter().any(|dep| active.authorises_start(dep, cfg)) {
         plan.to_start.push(unit.to_string());
@@ -394,11 +258,7 @@ fn plan_unit(
     }
 }
 
-/// Record that `unit` will be running once the plan is executed.
-///
-/// Template instances are also recorded under the un-instantiated template
-/// name (`myapp@.service`), because that is what `activates_file` derives from
-/// the changed file — one file, one entry, however many instances it has.
+/// Record `unit` as running after the plan, and its template if it has one.
 fn mark_activating(plan: &mut ActivationPlan, templates: &HashMap<String, String>, unit: &str) {
     plan.activating.insert(unit.to_string());
     if let Some(template) = templates.get(unit) {
@@ -406,23 +266,7 @@ fn mark_activating(plan: &mut ActivationPlan, templates: &HashMap<String, String
     }
 }
 
-/// Memoised unit states for one planning pass.
-///
-/// Every question sync asks about a unit — is it running, is it starting, is
-/// it merely idling in restart backoff — is derived from the one
-/// `ActiveState`/`SubState` pair systemd reports, so a unit costs a single
-/// `systemctl show` however many times it is consulted. The same few targets
-/// are otherwise queried once per changed unit.
-///
-/// Queued jobs are the exception: they are a property of the manager, not of a
-/// unit, so `systemctl list-jobs` is fetched once per pass — and only if some
-/// unit's own state left the question open.
-///
-/// The cache lives for one pass, so the counts per sync are: one `list-jobs`
-/// for activation planning, a second only when a slow image pull triggers a
-/// re-plan (deliberate — re-reading state after the pull is the point of
-/// re-planning), and none at all for stopping deleted units, which asks only
-/// about states.
+/// Unit states and the job list, each fetched at most once per planning pass.
 struct ActiveStates<'a> {
     systemd: &'a dyn SystemdTrait,
     states: HashMap<String, ActivationState>,
@@ -447,13 +291,12 @@ impl<'a> ActiveStates<'a> {
         state
     }
 
-    /// Running now, by `systemctl is-active`'s rule (so `reloading` counts).
+    /// Running, by `systemctl is-active`'s rule.
     fn is_active(&mut self, unit: &str, cfg: &Config) -> bool {
         self.state(unit, cfg).is_active()
     }
 
-    /// Running, or part-way through starting — anything with a process or a
-    /// container behind it right now.
+    /// Has a process or container behind it right now.
     fn is_running_or_starting(&mut self, unit: &str, cfg: &Config) -> bool {
         let state = self.state(unit, cfg);
         state.is_active() || state.is_starting()
@@ -465,26 +308,14 @@ impl<'a> ActiveStates<'a> {
             .contains(unit)
     }
 
-    /// Is systemd bringing this unit up, or has it already?
-    ///
-    /// Three distinct states answer yes, and none can stand in for the others:
-    /// running, `activating`, and `inactive` with a queued start job (a target
-    /// waiting for the units ordered before it, which is how a boot target
-    /// looks while quadcd's first sync runs).
+    /// Running, activating, or inactive with a queued start job (how a boot
+    /// target looks during the first sync).
     fn is_coming_up(&mut self, unit: &str, cfg: &Config) -> bool {
         self.is_running_or_starting(unit, cfg) || self.has_queued_start_job(unit, cfg)
     }
 
-    /// Would this unit's own activation make systemd start the units it wants?
-    ///
-    /// [`Self::is_coming_up`] minus `activating (auto-restart)`: a unit sitting
-    /// in restart backoff is reported as `activating` but is not starting
-    /// anything, and a crash-looping one can sit there indefinitely. Treating
-    /// it as authority would let a failing service resurrect a unit an operator
-    /// stopped, once per sync, forever.
-    ///
-    /// Inlines [`Self::is_coming_up`] against one fetched state rather than
-    /// calling it, which would fetch the same state a second time.
+    /// [`Self::is_coming_up`] minus restart backoff, so a crash-looping unit
+    /// cannot resurrect what it wants.
     fn authorises_start(&mut self, unit: &str, cfg: &Config) -> bool {
         let state = self.state(unit, cfg);
         if state.is_auto_restarting() {
@@ -494,31 +325,16 @@ impl<'a> ActiveStates<'a> {
     }
 }
 
-/// Move units that systemd will start as a side effect into the plan's
-/// `activating` set.
-///
-/// A skipped unit is not started by sync, but if something sync *is*
-/// activating would start it — wants, requires, binds to or upholds it —
-/// systemd brings it up in the same transaction, just as boot would.
-/// `web.image` required by a `web.container`
-/// being started is the common case: its image still has to be pre-pulled, or
-/// the download lands inline during unit start.
-///
-/// The closure covers the changed units, iterating until it stops growing: a
-/// chain `a` → `b` → `c` is followed when `b` is itself one of the changed
-/// units. A chain routed through an *unchanged* unit is not followed — the
-/// pre-pull this feeds is an optimisation, and resolving the full dependency
-/// graph would cost a `systemctl show` per intermediate.
+/// Mark skipped units that systemd will start as dependencies of activated ones
+/// (e.g. a `.image` required by a `.container`), so their images get pulled.
+/// Only chains through changed units are followed.
 fn mark_transitively_activated(
     plan: &mut ActivationPlan,
     skipped: &mut Vec<(String, Vec<String>)>,
     templates: &HashMap<String, String>,
     cfg: &Config,
 ) {
-    // Both action lists seed this. `to_restart` matters because a restart
-    // enqueues the unit's `Wants=`/`Requires=` just like a start does, so
-    // restarting an already-running unit still brings up a stopped dependency
-    // of it.
+    // A restart also starts the unit's dependencies.
     let mut pending: Vec<String> = plan
         .to_start
         .iter()
@@ -543,10 +359,7 @@ fn mark_transitively_activated(
     }
 }
 
-/// Carry out an [`ActivationPlan`] and report which units failed to come up.
-///
-/// Returns the list of units whose post-activation `ActiveState` is anything
-/// other than `active`/`activating` (i.e. failed to come up).
+/// Carry out an [`ActivationPlan`]; returns the units that failed to come up.
 pub(crate) fn execute_activation(
     systemd: &dyn SystemdTrait,
     plan: &ActivationPlan,
@@ -566,11 +379,8 @@ pub(crate) fn execute_activation(
         }
     }
 
-    // `StartOnSync=` units go first, in calls of their own. `systemctl start`
-    // and `restart` wait for the job to finish, so a build is complete before
-    // anything that uses its image is started; within one call systemd would
-    // run them in parallel, since nothing orders them. A failure here does not
-    // hold back the rest: the post-activation report below names it.
+    // StartOnSync= units first, in their own blocking call, so a build
+    // finishes before anything using its image starts.
     let (first_start, rest_start): (Vec<String>, Vec<String>) = to_start
         .iter()
         .cloned()
@@ -650,10 +460,7 @@ fn run_batch(
     }
 }
 
-/// Plan and immediately execute activation for `changed_files`.
-///
-/// Convenience wrapper around [`plan_activation`] + [`execute_activation`] for
-/// callers that do not need to inspect the plan in between.
+/// Plan and execute in one step, for tests.
 #[cfg(test)]
 pub(crate) fn activate_changed_units_inner(
     systemd: &dyn SystemdTrait,
@@ -664,30 +471,12 @@ pub(crate) fn activate_changed_units_inner(
     execute_activation(systemd, &plan, cfg)
 }
 
-/// Stop units whose backing files were deleted from the repo.
+/// Stop units whose files were deleted. Must run before `daemon-reload`, or
+/// their containers are orphaned.
 ///
-/// Must be called **before** `daemon-reload`: once systemd no longer sees the
-/// unit file, `systemctl stop` cannot reach the running container/process and
-/// it becomes orphaned.
-///
-/// - **Templates** (`foo@.service`): every loaded instance is stopped.
-///   `systemctl stop` on an already-inactive instance is a no-op, and passing
-///   it along makes sure nothing half-running survives the file's removal.
-/// - **Regular units**: stopped if a process or container is behind them right
-///   now — running (`active`, or mid-`reload`) or `activating`. The
-///   `activating` case matters for the same reason as the ordering above: a
-///   unit caught part-way through starting finishes bringing its container up
-///   moments later, and by then the unit file is gone and nothing can stop it.
-///
-/// A unit that merely holds a *queued* start job is deliberately left alone.
-/// Its job has not run, so there is no container to orphan — and stopping it
-/// would do real damage: `[Install] RequiredBy=` is materialised as a live
-/// `.requires/` symlink, and this runs before `daemon-reload` while that edge
-/// still exists, so `systemctl stop` would cancel the boot transaction's own
-/// start job and propagate the stop across `Requires=` to the requiring
-/// target. The job runs, the unit starts, and the following `daemon-reload`
-/// removes a unit systemd has already forgotten how to stop — but that race is
-/// narrow and far cheaper than tearing down a boot.
+/// Templates stop every loaded instance; other units are stopped if running or
+/// activating. A unit with only a queued start job is left alone: there is no
+/// container yet, and stopping it would propagate to a requiring boot target.
 pub(crate) fn stop_deleted_units_inner(
     systemd: &dyn SystemdTrait,
     deleted_files: &[String],
@@ -729,11 +518,6 @@ pub(crate) fn stop_deleted_units_inner(
             continue;
         }
 
-        // Anything with a process or container behind it right now. A unit
-        // caught mid-start would otherwise finish starting its container
-        // moments before `daemon-reload` removes the unit file, and the
-        // container is then orphaned with nothing left to stop it. A merely
-        // queued job is not included — see this function's documentation.
         if active.is_running_or_starting(unit, cfg) {
             to_stop.push(unit.clone());
         } else if cfg.verbose {
@@ -944,10 +728,7 @@ mod tests {
     #[case::inactive_without_deps_skipped(&[], &[], false, "skip")]
     #[case::active_without_deps_restarts(&[], &[], true, "restart")]
     #[case::active_with_inactive_deps_restarts(&["consumer.service"], &[], true, "restart")]
-    // `reverse_deps` returns the union of the start-authorising properties, so
-    // which one a name arrived through is invisible here by design; the case
-    // names record the intent. Which properties are queried in the first place
-    // is asserted in `sync::systemd`'s own tests.
+    // The mock cannot tell properties apart; case names record intent.
     fn activate_unit_by_state(
         #[case] reverse_deps: &[&str],
         #[case] active_deps: &[&str],
@@ -992,25 +773,12 @@ mod tests {
         }
     }
 
-    // Note on what is *not* tested here. The relationships that must never
-    // authorise a start — `ConsistsOf` (`PartOf=`), `TriggeredBy` (socket,
-    // timer and path activation), `RequisiteOf` (`Requisite=`) and the rest —
-    // cannot be pinned at this level: `MockSystemd::reverse_deps_map` returns
-    // whatever a test puts in it, so a unit with no reverse dependencies stays
-    // stopped regardless of which properties the real `reverse_deps` asks
-    // systemctl for. A test here would pass even if `TriggeredBy` were added
-    // to the queried set. The exclusions are pinned where they are decided
-    // instead: `reverse_deps_properties_exclude_non_starting_relationships` in
-    // `sync::systemd` guards the property list, and
-    // `reverse_deps_queries_only_start_authorising_properties` in
-    // `tests/fake_systemd.rs` guards the systemctl arguments actually sent.
+    // Which properties count (no PartOf=, TriggeredBy, ...) is tested in
+    // sync::systemd and tests/fake_systemd.rs, not here.
 
     #[test]
     fn plan_activates_unit_upheld_by_a_started_unit() {
-        // `helper.service` is `Upholds=`-ed by `web.service`, which is itself
-        // inactive but wanted by an active `default.target`. Starting
-        // `web.service` makes systemd bring `helper.service` up too, so its
-        // image has to be pre-pulled.
+        // Starting web.service brings up helper.service, which it upholds.
         let systemd = MockSystemd::new();
         systemd.set_active("default.target");
         systemd.reverse_deps_map.borrow_mut().insert(
@@ -1041,11 +809,7 @@ mod tests {
 
     #[test]
     fn activate_inactive_unit_wanted_by_target_with_queued_job_starts() {
-        // The boot case, as systemd actually reports it: a target that is
-        // waiting for the units ordered before it stays `ActiveState=inactive`
-        // (targets never report `activating`) and carries a queued start job.
-        // It is on its way up and will pull in what it wants, so it authorises
-        // the start.
+        // A booting target is inactive with a queued start job.
         let systemd = MockSystemd::new();
         systemd.queue_start_job("default.target");
         systemd.reverse_deps_map.borrow_mut().insert(
@@ -1148,10 +912,7 @@ mod tests {
 
     #[test]
     fn activate_activating_unit_with_no_reverse_deps_is_still_pre_pulled() {
-        // The regression this case exists for: with no reverse dependency to
-        // fall back on, a unit that is plainly starting used to be logged as
-        // "Skipping inactive" and lose its pre-pull, so a multi-GB image
-        // downloaded inline inside `podman run`.
+        // Regression: this used to be skipped and lose its pre-pull.
         let systemd = MockSystemd::new();
         systemd.set_activating("app.service");
         let err_buf = crate::output::tests::TestWriter::new();
@@ -1274,9 +1035,7 @@ mod tests {
 
     #[test]
     fn activate_does_not_start_for_an_auto_restarting_dependant() {
-        // A crash-looping dependant reports `activating (auto-restart)` but is
-        // not starting anything: it must not resurrect a unit an operator
-        // stopped, once per sync, for as long as it keeps failing.
+        // A crash-looping dependant must not resurrect a stopped unit.
         let systemd = MockSystemd::new();
         systemd.set_auto_restarting("flapper.service");
         systemd.reverse_deps_map.borrow_mut().insert(
@@ -1327,11 +1086,7 @@ mod tests {
 
     #[test]
     fn activate_fresh_clone_during_boot_starts_units_and_marks_dependencies() {
-        // End-to-end shape of the fresh-host bug: every unit file counts as
-        // changed, nothing is running yet, and the only reverse dependency is
-        // the boot target quadcd's own sync unit is wanted by — which is
-        // `inactive` with a queued start job for as long as the units ordered
-        // before it, quadcd's sync among them, are still coming up.
+        // Fresh host: everything changed, nothing running, boot target queued.
         let systemd = MockSystemd::new();
         systemd.queue_start_job("multi-user.target");
         systemd.reverse_deps_map.borrow_mut().insert(
