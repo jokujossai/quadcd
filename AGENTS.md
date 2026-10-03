@@ -10,18 +10,25 @@ QuadCD is a Rust systemd generator and git-sync deployment tool for Quadlet and 
 - `src/app.rs` - subcommand dispatch and app orchestration
 - `src/config.rs` - env/flag-derived runtime config
 - `src/cd_config.rs` - `quadcd.toml` loading
-- `src/install.rs` - file discovery, env substitution, installation
+- `src/install/mod.rs` - installation, `[Install]` symlinks, drop-ins
+- `src/install/discover.rs` - unit file discovery, generated unit names, duplicates
+- `src/install/content.rs` - env substitution, `SourcePath=`
+- `src/lock.rs` - sync lock
 - `src/dryrun.rs` - dry-run flow
 - `src/generator.rs` - `Generator` trait and `systemd-generator` invocation
 - `src/output.rs` - stdout/stderr abstraction
-- `src/sync/runner.rs` - sync orchestration
+- `src/sync/runner/mod.rs` - one-shot sync orchestration
+- `src/sync/runner/service.rs` - service loop, intervals, config reload
 - `src/sync/repo.rs` - per-repo git sync (`sync_repo_inner`)
 - `src/sync/vcs.rs` - `Vcs` trait and `GitVcs` implementation
 - `src/sync/image.rs` - `ImagePuller` trait for container image pre-pull
-- `src/sync/units.rs` - changed-unit detection and activation
+- `src/sync/units/files.rs` - unit file names and detection
+- `src/sync/units/plan.rs` - activation planning
+- `src/sync/units/execute.rs` - activation and stopping deleted units
 - `src/sync/settings.rs` - `[X-QuadCD]` per-unit settings (`StartOnSync=`, `Watch=`)
 - `src/sync/watch.rs` - `Watch=` glob matching against non-unit diff paths
-- `src/sync/systemd.rs` - systemd operations
+- `src/sync/systemd/mod.rs` - systemd operations
+- `src/sync/systemd/testing.rs` - `MockSystemd`
 - `tests/` - unit and integration tests
 - `tests/containerized/` - containerized integration tests
 - `.github/pull_request_template.md` - PR body structure (Summary, Related issue, AI usage, Checklist)
@@ -32,6 +39,8 @@ QuadCD is a Rust systemd generator and git-sync deployment tool for Quadlet and 
 - Keep `AGENTS.md`, `README.md`, and `CONTRIBUTING.md` aligned with the codebase.
 - Add or update tests when changing behavior.
 - Prefer focused changes and avoid unrelated refactors.
+- Split a file into logical submodules once it grows large (roughly 1000+
+  lines or several unrelated concerns); move its tests with the code.
 - Keep writing short: say what and the one non-obvious why, no history or edge-case essays.
   - Commit message: subject line plus at most 3 body lines.
   - CHANGELOG entry: 1–2 sentences.

@@ -322,7 +322,7 @@ fn sync_waits_for_held_lock_then_proceeds() {
 
     let data_dir = tmp.path().join(".local/share/quadcd");
     std::fs::create_dir_all(&data_dir).unwrap();
-    let lock = quadcd::install::acquire_sync_lock(&data_dir).unwrap();
+    let lock = quadcd::lock::acquire_sync_lock(&data_dir).unwrap();
 
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
