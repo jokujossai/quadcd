@@ -15,6 +15,10 @@
 - **Breaking (behaviour):** Image pre-pull follows the unit's pull policy (`Pull=` in `.container`, default `missing`; `Policy=` in `.image`, default `always`) via `podman pull --policy`. A `.container` image already present locally is no longer re-pulled unless its policy says so.
 - **Breaking (API):** `ImageRef` has a new public `pull_policy` field.
 
+### Fixed
+
+- **Breaking (MSRV):** Rust 1.88, the version dependencies already required (0.3.0 claimed 1.74 but never built on it). CI now tests the MSRV.
+
 ## 0.3.0 - 2026-08-19
 
 ### Added

@@ -78,6 +78,26 @@ jobs:
           minimum_coverage: 50
           show_line: true
 
+  msrv:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain from rust-version in Cargo.toml
+        id: msrv
+        run: |
+          msrv=$(sed -nE 's/^rust-version[[:space:]]*=[[:space:]]*"([0-9.]+)".*/\1/p' Cargo.toml)
+          if [ -z "$msrv" ]; then
+            echo "Error: failed to parse rust-version from Cargo.toml"
+            exit 1
+          fi
+          rustup toolchain install "$msrv" --profile minimal
+          echo "msrv=$msrv" >> "$GITHUB_OUTPUT"
+      - name: Test on MSRV
+        run: cargo +${{ steps.msrv.outputs.msrv }} test --locked
+
   audit:
     runs-on: ubuntu-latest
     permissions:
@@ -201,7 +221,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   release:
-    needs: [build, test, integration-test, audit]
+    needs: [build, test, msrv, integration-test, audit]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:

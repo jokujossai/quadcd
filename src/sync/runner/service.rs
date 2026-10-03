@@ -29,7 +29,7 @@ impl SyncRunner<'_> {
     /// `Some(mtime)` if the file is newer than `last`; `None` if not or on error.
     pub(crate) fn check_config_mtime(path: &Path, last: Option<SystemTime>) -> Option<SystemTime> {
         let mtime = fs::metadata(path).ok()?.modified().ok()?;
-        if last.map_or(true, |old| mtime > old) {
+        if last.is_none_or(|old| mtime > old) {
             Some(mtime)
         } else {
             None
