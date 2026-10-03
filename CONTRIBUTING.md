@@ -35,14 +35,11 @@ CI enforces all three — formatting, lints, and tests must pass.
 
 ### Integration Tests
 
-Most development changes only need the standard checks above. The containerized integration tests under `tests/containerized/` are slower, require Podman, and run inside a systemd-enabled container:
+For changes that depend on real systemd or Podman, run the containerized suite (needs Podman):
 
 ```sh
-podman build -t quadcd-test -f tests/containerized/image/Containerfile .
-podman run --rm -it --privileged --systemd=always quadcd-test
+./scripts/run-containerized-tests.sh
 ```
-
-Run the containerized suite when you change behavior that depends on real systemd, Podman, generators, or service-mode integration.
 
 ## Pull Requests
 

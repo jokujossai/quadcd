@@ -3,37 +3,58 @@
 [![CI](https://github.com/jokujossai/quadcd/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/jokujossai/quadcd/actions/workflows/build.yml)
 [![License: MIT](.github/badges/license.svg)](LICENSE)
 
-QuadCD deploys Quadlet and systemd unit files from local directories or git repositories, then keeps systemd in sync.
+QuadCD deploys Quadlet and systemd unit files from local directories or git repositories and keeps systemd in sync.
 
-## Supported Files
+Supported files: Quadlet `.container`, `.volume`, `.network`, `.kube`, `.image`, `.build`, `.pod`, `.artifact`; systemd `.service`, `.socket`, `.device`, `.mount`, `.automount`, `.swap`, `.target`, `.path`, `.timer`, `.slice`, `.scope`.
 
-- **Quadlet**: `.container`, `.volume`, `.network`, `.kube`, `.image`, `.build`, `.pod`, `.artifact`
-- **Systemd**: `.service`, `.socket`, `.device`, `.mount`, `.automount`, `.swap`, `.target`, `.path`, `.timer`, `.slice`, `.scope`
-
-## Usage
-
-Place your unit files in a subdirectory of the data directory and reload systemd. All subdirectories of the data directory are treated as source directories (e.g., `local/` for manually placed files, or named after git repos for synced files).
-
-Source directories are processed in lexicographic order, and files within each source tree are processed in lexicographic path order. If two files produce the same unit filename, the later path wins and quadcd warns about the duplicate.
-
-| Mode   | Data Directory             |
-|--------|----------------------------|
-| User   | `~/.local/share/quadcd/`   |
-| System | `/var/lib/quadcd/`         |
+## Install
 
 ```sh
-# User mode
-systemctl --user daemon-reload
+curl -fsSL https://raw.githubusercontent.com/jokujossai/quadcd/main/install.sh | sudo sh
+```
 
-# System mode
+Installs the latest release binary, the generator symlinks and the sync service units, then prints how to enable the service. `BINDIR` (default `/usr/local/bin`) and `PREFIX` (default `/etc/systemd`) change the install locations.
+
+<details>
+<summary>Manual install</summary>
+
+```sh
+# 1. Download quadcd-linux-<arch> and SHA256SUMS from the latest release, then:
+sha256sum -c --ignore-missing SHA256SUMS
+sudo install -Dm755 quadcd-linux-$(uname -m) /usr/local/bin/quadcd
+
+# 2. Generator symlinks
+sudo ln -sf /usr/local/bin/quadcd /etc/systemd/user-generators/quadcd
+sudo ln -sf /usr/local/bin/quadcd /etc/systemd/system-generators/quadcd
+
+# 3. Sync service units (optional)
+sudo curl -fsSL -o /etc/systemd/system/quadcd-sync.service \
+  https://raw.githubusercontent.com/jokujossai/quadcd/main/dist/quadcd-sync.service
+sudo curl -fsSL -o /etc/systemd/user/quadcd-sync.service \
+  https://raw.githubusercontent.com/jokujossai/quadcd/main/dist/quadcd-sync-user.service
 sudo systemctl daemon-reload
 ```
 
-## Examples
+</details>
 
-### Local Mode Example
+<details>
+<summary>Uninstall</summary>
 
-Create a local source directory and add a Quadlet file:
+```sh
+sudo systemctl disable quadcd-sync.service
+sudo systemctl --global disable quadcd-sync.service
+sudo rm -f /usr/local/bin/quadcd /etc/systemd/user-generators/quadcd /etc/systemd/system-generators/quadcd
+sudo rm -f /etc/systemd/system/quadcd-sync.service /etc/systemd/user/quadcd-sync.service
+sudo systemctl daemon-reload
+```
+
+</details>
+
+## Quick start
+
+### Local files
+
+Put unit files in any subdirectory of the data directory and reload systemd:
 
 ```sh
 mkdir -p ~/.local/share/quadcd/local
@@ -44,97 +65,39 @@ EOF
 systemctl --user daemon-reload
 ```
 
-QuadCD installs the source file into the generator working directory and Podman generates the corresponding user unit on reload.
+### Git sync
 
-### Sync Mode Example
-
-Create a sync config:
+`~/.config/quadcd.toml`:
 
 ```toml
 [repositories.myapp]
 url = "https://github.com/example/myapp.git"
-branch = "production"
-interval = "30m"
+branch = "production"   # optional, default: remote default branch
+interval = "30m"        # optional, for --service (s/m/h/d)
 ```
-
-Store it at `~/.config/quadcd.toml`, then run:
 
 ```sh
-quadcd sync --user
+quadcd sync --user                                # once
+systemctl --user enable --now quadcd-sync.service # continuously
 ```
 
-This clones the repository into `~/.local/share/quadcd/myapp/`, installs any supported Quadlet or systemd unit files it contains, reloads systemd, and starts or restarts changed units as needed.
+The repo is cloned into `~/.local/share/quadcd/myapp/`.
 
-## Command Line Options
+## How sync activates units
 
-### Generate (systemd generator mode)
+After pulling, sync runs `daemon-reload` and handles each changed unit the way a reboot would:
 
-```sh
-quadcd generate [-v] [-no-kmsg-log] [-user] [-dryrun] normal-dir [early-dir] [late-dir]
-```
+- **Active** (or crash-looping): restarted.
+- **Inactive**: started only if a unit that wants it (`WantedBy=`, `RequiredBy=`, `BoundBy=`, `UpheldBy=`) is coming up — active, activating, or with a queued start job. Units stopped by hand stay stopped. `PartOf=`, `Requisite=`, `Conflicts=` and socket/timer/path activation do not count.
+- **Already starting**: left to its job; the new config applies on its next restart.
+- **Template**: each loaded instance follows the rules above.
+- **Deleted**: stopped before `daemon-reload`.
 
-| Option | Description |
-|--------|-------------|
-| `-v` | Verbose output |
-| `-no-kmsg-log` | Disable kmsg logging (for quadlet compatibility) |
-| `-user` | Force user mode |
-| `-dryrun` | Dry-run mode (no changes, implies -v) |
+Images are pre-pulled only for units that will be running.
 
-Generator mode is also activated automatically when:
-- The binary is invoked via a symlink whose basename is not `quadcd` (e.g., `podman-user-generator` or `podman-system-generator`).
-- `SYSTEMD_SCOPE` is set and the positional arguments look like a generator invocation (1 or 3 args, first is an existing directory).
+## Unit settings: `[X-QuadCD]`
 
-#### `[Install]` Sections in Plain Systemd Units
-
-Generated units cannot be enabled with `systemctl enable`, so an `[Install]` section alone would never make a plain `.service`, `.timer` or `.socket` start at boot. The generator therefore materialises the section itself, the same way Quadlet does for its own units: each target in `WantedBy=` gets a `<target>.wants/<unit>` symlink in the generator directory, and each target in `RequiredBy=` gets a `<target>.requires/<unit>` one. The links are relative, pointing at the installed unit next to the directory.
-
-```ini
-# backup.timer
-[Install]
-WantedBy=timers.target
-```
-
-generates `timers.target.wants/backup.timer`, which is what pulls the timer in at boot — and, because sync starts an inactive changed unit when something that wants it is coming up (see [Sync](#sync-git-based-continuous-deployment) below), what lets a first sync start it too.
-
-Values are space-separated and accumulate across repeated assignments; an empty assignment (`WantedBy=`) resets the list, following systemd. Other `[Install]` directives — `Alias=`, `Also=`, `DefaultInstance=` — are not acted on. Quadlet units are unaffected: Podman's generator handles their `[Install]` sections.
-
-### Sync (git-based continuous deployment)
-
-```sh
-quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i] [--user] [-v]
-```
-
-| Option | Description |
-|--------|-------------|
-| `-v` | Verbose output |
-| `--service` | Long-running service mode with file watching and interval-based syncing |
-| `--sync-only` | Pull changes but skip `daemon-reload`, image pre-pulls, and service start/restart |
-| `--force` | Allow URL changes and use `git reset --hard` instead of `git pull --ff-only` |
-| `--accept-new-host-keys` | Accept unknown SSH host keys on first connect (TOFU) |
-| `-i`, `--interactive` | Enable interactive mode (allows SSH prompts for host keys, credentials) |
-| `--user` | Force user mode |
-
-Sync pulls unit files from configured git repositories into the data directory, then triggers `systemctl daemon-reload` and restarts changed units with `systemctl restart`.
-
-A changed unit is restarted when it is active, and started when it is inactive but some unit that is *coming up* would itself start it — that is, that unit declares `Wants=`, `Requires=`, `BindsTo=` or `Upholds=` on it (seen from the changed unit's side as `WantedBy=`, `RequiredBy=`, `BoundBy=` and `UpheldBy=`). This approximates what a reboot would bring up, so a unit stopped by hand is not resurrected.
-
-"Coming up" means running (`active`, or mid-`reload`), `activating`, or holding a queued start job. The last case is what makes the first sync after a reboot work: a target implicitly orders itself after every unit it wants, so until those have started it stays `inactive` with its own start job queued — targets never report `activating`. Whether the boot target is still queued when the first sync runs depends on what else is starting at the time; on a fast boot it may already be `active`. Both readings have to work, and before this only the `active` one did.
-
-A unit that is `activating (auto-restart)` — failed and waiting out `Restart=` — does not count as coming up. It is reported as `activating` but is starting nothing, and a crash-looping unit can sit there indefinitely; treating it as authority would let a failing service restart a unit an operator stopped, once per sync, for as long as it keeps failing.
-
-A changed unit that is *itself* already coming up is left to the job systemd has in flight: sync issues no command, because a restart would tear down a start already underway and a start would only be merged into the same job. Its image is still pre-pulled. Such a unit finishes starting with the configuration systemd loaded when the job was created — the pre-change one — and the new configuration applies the next time something restarts it.
-
-Relationships that never make systemd start a unit do not count: `PartOf=` only propagates stop and restart, `Requisite=` checks a unit rather than starting it, and `Conflicts=` stops it. Socket-, timer- and path-activated services are also left alone while inactive — the point of `TriggeredBy=` activation is that the service starts on demand, and a reboot leaves it inactive until the trigger fires. (One that is already running when its file changes is restarted like any other active unit.)
-
-`UpheldBy=` requires systemd 249 or newer. On older systemd it is simply not reported and contributes nothing to the decision; the other three relationships are unaffected.
-
-Units that stay stopped are left alone, and their container images are not pre-pulled. Images are still pre-pulled for units systemd starts as a dependency of a unit sync starts, such as an `.image` unit required by a `.container`.
-
-A changed template unit (`myapp@.container`) is expanded to the instances systemd has loaded, and each instance is then judged by the same rules: running instances are restarted, stopped or failed ones are started only when something coming up wants or requires them. A template whose instances all stay stopped is not pre-pulled either.
-
-#### `[X-QuadCD]` Settings
-
-Per-unit sync settings go in an `[X-QuadCD]` section of the unit file itself. systemd ignores sections whose names start with `X-`, and Quadlet only checks keys in its own sections, so the section does not affect the unit. Sync reads it from the source files in the repo; no variable substitution is applied.
+Optional section in any unit file. systemd and Quadlet ignore it; no variable substitution.
 
 ```ini
 # app.build
@@ -148,263 +111,83 @@ Watch=Containerfile
 Watch=repo/**
 ```
 
-| Key | Description |
-|-----|-------------|
-| `StartOnSync=` | Boolean. When the unit changes and is inactive (or failed), start it even if nothing coming up wants it. |
-| `Watch=` | Glob of other repo files, relative to the unit file's directory. When a sync's diff touches a matching file, the unit is treated as changed even though its own file is not. May be given multiple times; an empty `Watch=` clears the list. |
+| Key | Effect |
+|-----|--------|
+| `StartOnSync=` | Start the unit when it changes, even if nothing wants it. These units go first and are waited for, so a build finishes before the container using its image. Ignored on templates. |
+| `Watch=` | Glob (`*`, `?`, `**`) of repo files, relative to the unit's directory; a change marks the unit changed. Repeatable. Only changes pulled by sync count. |
 
-`StartOnSync=` is meant for units that nothing should start at boot but that must run when they change, such as an image build used by a container through `Image=localhost/...` and `Pull=never` rather than a `.build` reference (which would make the build a hard dependency of the container). It is the one deliberate exception to mirroring a reboot: a `StartOnSync=` unit that an operator stopped by hand is started again the next time it changes.
+## Reference
 
-`StartOnSync=` units are started (or restarted, when already active) before every other unit in the same sync, in a `systemctl` call of their own. That call waits for the job to finish, so on a first deploy the build completes before the container that uses its image is started. A failing `StartOnSync=` unit does not hold back the rest; it is reported with the other failures. A long build keeps sync busy for its whole duration.
+### Commands
 
-`StartOnSync=` on a template unit (`foo@.build`) is ignored with a warning, since sync cannot know which instances to start.
-
-`Watch=` globs support `*` and `?` within one path segment and `**` as a whole segment matching any number of directories (`repo/**` matches every file below `repo/`). `..` may be used as long as the path stays inside the repository; globs that escape it, and absolute paths, are ignored with a warning. Added, modified, deleted and renamed files all count. A unit marked changed this way is then handled like any other changed unit: restarted when active, or started when inactive if `StartOnSync=` is set or something coming up wants it.
-
-`Watch=` only sees the diff between the commits before and after a sync, within the unit's own repository. A fresh clone already treats every unit as changed. Files changed outside sync — for example by a manual `git pull` in the data directory — are not noticed, because the next sync finds nothing new to diff.
-
-SSH known hosts are stored in the data directory (`.known_hosts` file) to avoid issues with system SSH config under systemd sandboxing. Use `--accept-new-host-keys` for initial setup to automatically accept host keys on first connect, or `-i` for fully interactive SSH (manual host key approval, credential prompts).
-
-### Version
-
-```sh
+```text
+quadcd generate [-v] [-no-kmsg-log] [-user] [-dryrun] normal-dir [early-dir] [late-dir]
+quadcd sync [--service] [--sync-only] [--force] [--accept-new-host-keys] [-i] [--user] [-v]
+quadcd status [--no-fetch] [--json] [--user] [-v]
 quadcd version
-```
-
-Print the version and exit. The `-version` flag also works anywhere in the command line for backwards compatibility.
-
-### Help
-
-```sh
 quadcd help
 ```
 
-Print usage information and exit.
+| Option | Description |
+|--------|-------------|
+| `-dryrun` | Show what `generate` would produce, without changes |
+| `--service` | Keep running; sync each repo on its `interval` and reload on config changes |
+| `--sync-only` | Pull only; no `daemon-reload`, pre-pull or start/restart |
+| `--force` | Allow URL changes; `git reset --hard` instead of `pull --ff-only` |
+| `--accept-new-host-keys` | Trust unknown SSH host keys on first connect |
+| `-i` | Interactive git/SSH (host key and credential prompts) |
+| `--no-fetch` | `status` without network access |
+| `--json` | `status` as JSON |
+| `--user`, `-user` | Force user mode |
+| `-v` | Verbose |
 
-#### Configuration
+`status` reports repo and service state and exits non-zero on any problem. `generate` also runs automatically when invoked through a generator symlink, or with `SYSTEMD_SCOPE` set and generator-style arguments.
 
-Create a config file at `~/.config/quadcd.toml` (user) or `/etc/quadcd.toml` (system):
+### Paths
 
-```toml
-[repositories.myapp]
-url = "https://github.com/example/myapp.git"
-branch = "production"    # optional, defaults to remote default
-interval = "30m"         # optional, for --service mode (s/m/h/d)
-```
+| Mode | Data directory | Config |
+|------|----------------|--------|
+| User | `~/.local/share/quadcd/` | `~/.config/quadcd.toml` |
+| System | `/var/lib/quadcd/` | `/etc/quadcd.toml` |
 
-Override the config path with `QUADCD_CONFIG`.
+Files are processed in path order; if two produce the same unit name, the later wins with a warning. SSH known hosts are kept in `<data dir>/.known_hosts`.
 
-## Runtime Environment Variables
-
-These environment variables override quadcd's default behavior:
+### Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `QUADCD_CONFIG` | `~/.config/quadcd.toml` or `/etc/quadcd.toml` | Path to the sync configuration file |
-| `QUADCD_UNIT_DIRS` | (all subdirectories of data dir) | Override the source directory (single path) |
-| `QUADLET_UNIT_DIRS` | (auto-detected) | Override the quadlet output directory |
-| `QUADLET_DROPINS_UNIT_DIRS` | mode-specific standard Quadlet drop-ins dir | Override the directory scanned for `*.d/` Quadlet drop-ins |
-| `PODMAN_GENERATOR_PATH` | (auto-detected) | Override the podman generator binary path |
-| `GIT_COMMAND` | `git` | Override the git binary path |
-| `GIT_TIMEOUT` | `300` seconds | Timeout for git operations |
-| `PODMAN_PULL_TIMEOUT` | `60` seconds | Timeout for pre-pulling container images in sync mode |
-| `SYSTEMD_SCOPE` | (unset) | Systemd scope detection (`system` = system mode, any other non-empty value = user mode) |
+| `QUADCD_CONFIG` | see [Paths](#paths) | Sync config file |
+| `QUADCD_UNIT_DIRS` | all data dir subdirectories | Single source directory |
+| `QUADLET_UNIT_DIRS` | auto-detected | Quadlet output directory |
+| `QUADLET_DROPINS_UNIT_DIRS` | standard Quadlet directory | Where `*.d/` drop-ins are read from |
+| `PODMAN_GENERATOR_PATH` | auto-detected | Podman generator binary |
+| `GIT_COMMAND` | `git` | Git binary |
+| `GIT_TIMEOUT` | `300` s | Git operation timeout |
+| `PODMAN_PULL_TIMEOUT` | `60` s | Image pre-pull timeout |
+| `SYSTEMD_SCOPE` | unset | `system` = system mode, other non-empty = user mode |
 
-## Variable Substitution
+### Variable substitution
 
-QuadCD supports `${VAR}` substitution using a `.env` file in the data directory (`~/.local/share/quadcd/.env` or `/var/lib/quadcd/.env`).
-
-Only variables defined in the `.env` file will be substituted, protecting other shell variables in your unit files.
-
-### Example
-
-**~/.local/share/quadcd/.env**:
-
-```sh
-REGISTRY=docker.io
-IMAGE_TAG=latest
-```
-
-**~/.local/share/quadcd/local/myapp.container**:
+`${VAR}` in unit files is replaced from `<data dir>/.env`; undefined variables are left alone. `${QUADCD_REPO_ROOT}` is always the unit's source directory:
 
 ```ini
 [Container]
-Image=${REGISTRY}/myimage:${IMAGE_TAG}
-```
-
-### Reserved Variables
-
-QuadCD always sets the following variable when processing a source directory; user `.env` files cannot override it.
-
-| Variable | Value |
-|----------|-------|
-| `QUADCD_REPO_ROOT` | Absolute path of the source directory the unit was loaded from (e.g. the synced repo checkout, or `~/.local/share/quadcd/local/`) |
-
-This lets you mount configuration files committed alongside your unit files into containers:
-
-**~/.local/share/quadcd/<repo>/myapp.container**:
-
-```ini
-[Container]
-Image=ghcr.io/me/app:latest
+Image=${REGISTRY}/app:${TAG}
 Volume=${QUADCD_REPO_ROOT}/configs/app.yaml:/etc/app.yaml:Z,ro
 ```
 
-When the unit is generated, `${QUADCD_REPO_ROOT}` is replaced with the absolute path of the directory holding `myapp.container`.
+### Drop-ins
 
-## Drop-in Files
+`*.d/` directories from `~/.config/containers/systemd/` (user) or `/etc/containers/systemd/` (system) are applied, e.g.:
 
-Podman and systemd support drop-in configuration files that let you override or extend base unit files. QuadCD automatically symlinks `*.d/` drop-in directories from the standard Quadlet directory into the generator's working directory, so they are applied when the Podman generator runs.
+- `foo.container.d/*.conf` — one unit
+- `foo-.container.d/*.conf` — units named `foo-*`
+- `container.d/*.conf` — all containers
 
-### Drop-in Directories
+### `[Install]` in plain systemd units
 
-| Mode   | Quadlet Drop-ins | Systemd Drop-ins |
-|--------|------------------|------------------|
-| User   | `~/.config/containers/systemd/*.d/` | `~/.config/systemd/user/*.d/` |
-| System | `/etc/containers/systemd/*.d/` | `/etc/systemd/system/*.d/` |
+`WantedBy=` and `RequiredBy=` become `.wants`/`.requires` symlinks, like Quadlet does, since generated units cannot be enabled. `Alias=`, `Also=` and `DefaultInstance=` are ignored.
 
-### How Drop-ins Work
+## Development
 
-For a unit file `foo.container`, create drop-in files in:
-
-1. `foo.container.d/*.conf` - Specific to this unit
-2. `foo-.container.d/*.conf` - For units starting with `foo-`
-3. `container.d/*.conf` - Global defaults for all containers
-
-Drop-ins are merged in alphabetical order, with more specific paths taking precedence.
-
-### Example: Global Container Defaults
-
-**~/.config/containers/systemd/container.d/10-defaults.conf**:
-
-```ini
-[Container]
-LogDriver=journald
-
-[Service]
-Restart=always
-```
-
-This applies to all `.container` units.
-
-**Note:** Drop-in values override values defined in the base quadlet files.
-
-### Example: Unit-Specific Override
-
-**~/.config/containers/systemd/nginx.container.d/20-volumes.conf**:
-
-```ini
-[Container]
-Volume=/data/nginx:/usr/share/nginx/html:ro
-```
-
-This only applies to `nginx.container`.
-
-### Overriding the Drop-in Source Directory
-
-Set `QUADLET_DROPINS_UNIT_DIRS` to override the directory
-that QuadCD scans for `*.d/` drop-in directories. By default
-it uses the standard Quadlet directory for the current mode
-(`~/.config/containers/systemd/` for user mode,
-`/etc/containers/systemd/` for system mode).
-
-## Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/jokujossai/quadcd/main/install.sh | sudo sh
-```
-
-This POSIX `sh` installer is fetched from `main`, but it installs the latest
-published release binary to `/usr/local/bin/quadcd`, creates symlinks in both
-user and system generator directories, installs sync service unit files, and
-prints instructions for enabling them. The installer is kept backward
-compatible with the latest published release assets and bundled service files.
-
-### Installer Environment Variables
-
-| Variable | Default          | Description              |
-|----------|------------------|--------------------------|
-| `BINDIR` | `/usr/local/bin` | Binary install location  |
-| `PREFIX` | `/etc/systemd`   | Systemd generator prefix |
-
-<details>
-<summary>Manual install</summary>
-
-1. Download the binary and `SHA256SUMS` for your architecture from the
-   [latest release](https://github.com/jokujossai/quadcd/releases/latest)
-   and verify the checksum:
-
-   ```sh
-   sha256sum -c --ignore-missing SHA256SUMS
-   ```
-
-2. Install the binary:
-
-   ```sh
-   sudo install -Dm755 quadcd-linux-$(uname -m) /usr/local/bin/quadcd
-   ```
-
-3. Create generator symlinks:
-
-   ```sh
-   sudo ln -sf /usr/local/bin/quadcd /etc/systemd/user-generators/quadcd
-   sudo ln -sf /usr/local/bin/quadcd /etc/systemd/system-generators/quadcd
-   ```
-
-4. Install the sync service units (optional, for git-based continuous deployment):
-
-   ```sh
-   sudo curl -fsSL -o /etc/systemd/system/quadcd-sync.service \
-     https://raw.githubusercontent.com/jokujossai/quadcd/main/dist/quadcd-sync.service
-   sudo curl -fsSL -o /etc/systemd/user/quadcd-sync.service \
-     https://raw.githubusercontent.com/jokujossai/quadcd/main/dist/quadcd-sync-user.service
-   ```
-
-5. Reload systemd:
-
-   ```sh
-   sudo systemctl daemon-reload
-   systemctl --user daemon-reload
-   ```
-
-6. Enable the sync service if installed in step 4:
-
-   ```sh
-   # System mode
-   sudo systemctl enable --now quadcd-sync.service
-
-   # User mode (per user)
-   systemctl --user enable --now quadcd-sync.service
-   ```
-
-</details>
-
-### Uninstall
-
-```sh
-sudo systemctl disable quadcd-sync.service
-sudo systemctl --global disable quadcd-sync.service
-sudo rm -f /usr/local/bin/quadcd
-sudo rm -f /etc/systemd/user-generators/quadcd
-sudo rm -f /etc/systemd/system-generators/quadcd
-sudo rm -f /etc/systemd/system/quadcd-sync.service /etc/systemd/user/quadcd-sync.service
-sudo systemctl daemon-reload
-```
-
-## Testing
-
-Run the standard checks with:
-
-```sh
-cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
-```
-
-Run the containerized integration suite with the helper script:
-
-```sh
-./scripts/run-containerized-tests.sh
-```
-
-This builds `tests/containerized/image/Containerfile` with Podman and then runs the resulting test image with `--privileged` and `--systemd=always`.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
