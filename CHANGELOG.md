@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## 0.4.0 - 2026-10-03
 
 ### Added
 
@@ -10,10 +10,11 @@
 
 ### Changed
 
-- **Breaking (API):** `UnitChanges` has a new public `other` field (non-unit paths from the diff).
-- Shortened the changelog, README and code comments.
 - **Breaking (behaviour):** Image pre-pull follows the unit's pull policy (`Pull=` in `.container`, default `missing`; `Policy=` in `.image`, default `always`) via `podman pull --policy`. A `.container` image already present locally is no longer re-pulled unless its policy says so.
-- **Breaking (API):** `ImageRef` has a new public `pull_policy` field.
+- **Breaking (API):** `UnitChanges` has a new public `other` field (non-unit paths from the diff).
+- **Breaking (API):** `ImageRef` has a new public `pull_policy` field of the new type `sync::PullPolicy`.
+- **Breaking (API):** `acquire_sync_lock` and `try_acquire_sync_lock` moved from `quadcd::install` to `quadcd::lock`.
+- Shortened the changelog, README and code comments.
 
 ### Fixed
 
