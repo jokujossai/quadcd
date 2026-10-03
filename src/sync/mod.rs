@@ -19,7 +19,7 @@ mod units;
 mod vcs;
 mod watch;
 
-pub use image::{ImagePuller, ImageRef};
+pub use image::{ImagePuller, ImageRef, PullPolicy};
 pub use podman::Podman;
 pub use repo::{SyncResult, SyncStatus};
 pub use runner::SyncRunner;

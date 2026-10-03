@@ -12,6 +12,8 @@
 
 - **Breaking (API):** `UnitChanges` has a new public `other` field (non-unit paths from the diff).
 - Shortened the changelog, README and code comments.
+- **Breaking (behaviour):** Image pre-pull follows the unit's pull policy (`Pull=` in `.container`, default `missing`; `Policy=` in `.image`, default `always`) via `podman pull --policy`. A `.container` image already present locally is no longer re-pulled unless its policy says so.
+- **Breaking (API):** `ImageRef` has a new public `pull_policy` field.
 
 ## 0.3.0 - 2026-08-19
 
