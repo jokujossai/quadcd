@@ -46,3 +46,4 @@ For changes that depend on real systemd or Podman, run the containerized suite (
 - Keep PRs focused on a single change
 - Include tests for new functionality
 - Follow existing code style and patterns
+- Split files into logical submodules once they grow large

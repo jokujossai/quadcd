@@ -20,6 +20,7 @@ pub(crate) mod cli;
 pub mod config;
 pub(crate) mod dryrun;
 pub mod install;
+pub mod lock;
 pub mod output;
 pub mod status;
 pub mod sync;

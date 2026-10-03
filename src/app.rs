@@ -397,7 +397,7 @@ impl<'a> App<'a> {
             runner.run_service(cd_config, &SHUTDOWN);
             0
         } else {
-            let _lock = match install::acquire_sync_lock(&self.cfg.data_dir) {
+            let _lock = match crate::lock::acquire_sync_lock(&self.cfg.data_dir) {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = writeln!(self.cfg.output.err(), "Error: {e}");
